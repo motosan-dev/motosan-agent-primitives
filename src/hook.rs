@@ -16,7 +16,7 @@
 //!
 //! - **D5 = A (revised after Codex research):** every lifecycle context
 //!   struct carries a
-//!   [`CancellationToken`](tokio_util::sync::CancellationToken). Long-running
+//!   [`tokio_util::sync::CancellationToken`]. Long-running
 //!   hooks (PII redaction, audit log flush, …) should poll
 //!   `cancellation_token.is_cancelled()` or `select!` against
 //!   `cancelled().await` and return early.

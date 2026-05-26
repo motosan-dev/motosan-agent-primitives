@@ -26,7 +26,7 @@
 //! allowed so the agent can fetch documentation and browse while planning.
 //! This is more permissive than the original "deny network too" proposal
 //! and shifts correctness onto tool-author annotations — see
-//! [`ToolAnnotations`](crate::tool::ToolAnnotations).
+//! [`ToolAnnotations`].
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -93,7 +93,7 @@ pub enum PermissionMode {
     /// (HTTP `POST`, irreversible side effect, money movement, …) **will
     /// run in plan mode**. Tool authors are responsible for accurate
     /// annotations; see the type-level warning on
-    /// [`ToolAnnotations`](crate::tool::ToolAnnotations). When the
+    /// [`ToolAnnotations`]. When the
     /// destructive flag is wrong, plan mode is unsafe.
     Plan,
     /// User must approve every non-read-only tool individually.
@@ -119,7 +119,7 @@ pub struct PermissionContext<'a> {
     /// JSON arguments that will be passed to the tool.
     pub tool_input: &'a serde_json::Value,
     /// Annotations declared by the tool. See
-    /// [`ToolAnnotations`](crate::tool::ToolAnnotations) for the
+    /// [`ToolAnnotations`] for the
     /// destructive-annotation correctness contract.
     pub annotations: &'a ToolAnnotations,
     /// Current session trust mode.

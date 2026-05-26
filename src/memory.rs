@@ -1,6 +1,6 @@
 //! Memory **schema** declaration (no storage).
 //!
-//! A [`Harness`] (defined in `motosan-agent-harness`) can declare which
+//! A `Harness` (defined in the future `motosan-agent-harness` crate) can declare which
 //! long-term context keys it expects to read or write via a
 //! [`MemorySchema`]. Storage backends, fetch policies, summarisation —
 //! none of that lives here. This crate only owns the schema vocabulary so
