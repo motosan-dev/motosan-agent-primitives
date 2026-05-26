@@ -161,6 +161,19 @@ pub enum ContentBlock {
         #[serde(default, skip_serializing_if = "is_false")]
         is_error: bool,
     },
+    /// Structured JSON content that downstream processors (redact, citation
+    /// extractors, validators) can walk recursively without re-parsing a
+    /// string. Use this when the tool result is genuinely structured data
+    /// rather than text; for opaque text, prefer [`ContentBlock::Text`].
+    ///
+    /// Wire-format tag: `"json"` (auto-derived from the enum's serde
+    /// `rename_all = "snake_case"`).
+    Json {
+        /// The JSON payload — serialized as a normal JSON tree, NOT as a
+        /// string. A consumer can `match` on this variant and walk
+        /// `value` directly.
+        value: serde_json::Value,
+    },
 }
 
 fn is_false(b: &bool) -> bool {
@@ -374,5 +387,26 @@ mod tests {
         let s = serde_json::to_string(&m).unwrap();
         let back: Message = serde_json::from_str(&s).unwrap();
         assert_eq!(m, back);
+    }
+
+    #[test]
+    fn content_block_json_round_trip() {
+        use serde_json::json;
+        let cb = ContentBlock::Json {
+            value: json!({ "user": "alice", "score": 42, "tags": ["a", "b"] }),
+        };
+        let s = serde_json::to_string(&cb).unwrap();
+        let back: ContentBlock = serde_json::from_str(&s).unwrap();
+        assert_eq!(cb, back);
+    }
+
+    #[test]
+    fn content_block_json_serde_tag() {
+        use serde_json::json;
+        let cb = ContentBlock::Json { value: json!({"k": 1}) };
+        let v = serde_json::to_value(&cb).unwrap();
+        assert_eq!(v["type"], "json");
+        // value is the JSON tree itself, not a string:
+        assert_eq!(v["value"]["k"], 1);
     }
 }
