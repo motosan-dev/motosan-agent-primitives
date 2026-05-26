@@ -1,0 +1,7 @@
+{
+  "type": "image",
+  "source": {
+    "type": "url",
+    "url": "https://example.com/cat.png"
+  }
+}
