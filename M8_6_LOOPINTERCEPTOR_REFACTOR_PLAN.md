@@ -315,7 +315,7 @@ Total: **11 days focused work + 1-2 days unknown-unknowns = 12-13 days. Calendar
     - `before_compact` — invoke from `extensions/autocompact/extension.rs` at the compaction trigger point
     - `on_subagent_stop` — interceptor dispatcher exposes a `dispatch_subagent_stop(result)` entry point; subagent's termination path will call it in Phase F (so a stub callsite in loop is enough here; subagent wires it up later)
 
-**Gate:** `cargo build && cargo test` green. `grep -rn 'Extension' src/` returns nothing (allow CHANGELOG mentions). All 9 Hook lifecycle methods now have a corresponding `LoopInterceptor` method on the trait surface.
+**Gate:** `cargo build && cargo test --all-features` green. `grep -rn 'Extension' src/` returns nothing (allow CHANGELOG mentions). All 9 Hook lifecycle methods now have a corresponding `LoopInterceptor` method on the trait surface. (`--all-features` is mandatory — loop has 4 feature flags gating 7 integration test files; without the flag those test files compile to empty and silently "pass.")
 
 ### Phase B — Hook adapter (1.5 days)
 
@@ -365,7 +365,7 @@ Total: **11 days focused work + 1-2 days unknown-unknowns = 12-13 days. Calendar
 4. Add `RunBuilder::permission_timeout(Duration)` per D-M86-7.
 5. `tests/permission_gating.rs`: add AskUser-approve and AskUser-deny sub-tests. Use `tokio::sync::mpsc` to send scripted `AskUserAnswer` ops.
 
-**Gate:** all 4 sub-tests in `permission_gating.rs` green; `hook_lifecycle.rs` green; build/test green for `motosan-agent-loop` 0.24.0-rc.
+**Gate:** all 4 sub-tests in `permission_gating.rs` green; `hook_lifecycle.rs` green; `cargo build && cargo test --all-features` green for `motosan-agent-loop` 0.24.0-rc.
 
 ### Phase E — Loop checkpoint (0.5 day) ⚠️ MANDATORY
 
@@ -387,7 +387,7 @@ Total: **11 days focused work + 1-2 days unknown-unknowns = 12-13 days. Calendar
 6. **Wire `on_subagent_stop` invocation** per D-M86-13: at the subagent termination path (`src/subagent/driver.rs` or `manager.rs` — locate during execution), call into the loop's interceptor dispatcher `dispatch_subagent_stop(result)`. This is the callsite stub left in Phase A step 11.
 7. CHANGELOG 0.3.0 entry (BREAKING)
 
-**Gate:** `cargo build && cargo test --features testing` green in subagent. (The `--features testing` flag is mandatory — subagent's integration tests are all `#![cfg(feature = "testing")]` gated and would trivially "pass" without the flag. This is the gap that hid the broken `opt_out_layers.rs` test post-M8 Step 4; see [motosan-agent-subagent commit `e2e50de`](https://github.com/motosan-dev/motosan-agent-subagent/commit/e2e50de).)
+**Gate:** `cargo build && cargo test --all-features` green in subagent. (The `--all-features` flag is mandatory — subagent's integration tests are all `#![cfg(feature = "testing")]` gated and would trivially "pass" without the flag. This is the gap that hid the broken `opt_out_layers.rs` test post-M8 Step 4; see [motosan-agent-subagent commit `e2e50de`](https://github.com/motosan-dev/motosan-agent-subagent/commit/e2e50de). Subagent only has one custom feature so `--all-features` ≡ `--features testing`, but the flag is consistent with the loop gate.)
 
 ### Phase G — Subagent checkpoint (0.5 day) ⚠️ MANDATORY
 
@@ -418,22 +418,29 @@ From clean checkouts:
 for repo in motosan-agent-tool motosan-agent-loop motosan-ai/sdks/rust \
             motosan-agent-subagent motosan-sandbox motosan-agent-harness agemo; do
   cd /Users/daiwanwei/Projects/wade/$repo
-  if [ "$repo" = "motosan-agent-subagent" ]; then
-    # subagent integration tests are all #![cfg(feature = "testing")];
-    # without the flag they trivially "pass" with 0 tests — masks regressions.
-    cargo build && cargo test --features testing
-  else
-    cargo build && cargo test
-  fi
+  case "$repo" in
+    # Loop has 4 feature flags (testing/cancellation/mcp-client/motosan-ai)
+    # gating 7 integration test files; subagent has 1 (testing) gating 7.
+    # Without --all-features, those files compile to empty and trivially
+    # "pass" with 0 tests — silently masking regressions.
+    motosan-agent-loop|motosan-agent-subagent)
+      cargo build && cargo test --all-features
+      ;;
+    *)
+      cargo build && cargo test
+      ;;
+  esac
   [ $? -eq 0 ] || { echo "FAIL: $repo"; exit 1; }
 done
 ```
+
+Note: `--all-features` on loop pulls in `motosan-ai` and `mcp-client` deps, adding ~1-2 min of compile time. Live tests inside (`live_anthropic.rs`, `mcp_http_live.rs`) self-skip when env vars / external services are absent — they're compile-checked but don't run.
 
 All must pass. Primitives untouched (no commits).
 
 ## 6. Acceptance gates (final)
 
-1. `cargo build` + `cargo test` green in: loop 0.24.0, agemo 0.1.1. For subagent 0.3.0: `cargo build && cargo test --features testing` (the feature flag is mandatory — see Phase F gate note).
+1. `cargo build && cargo test` green in: agemo 0.1.1. For loop 0.24.0 and subagent 0.3.0: `cargo build && cargo test --all-features` (the flag is mandatory — both crates have integration tests behind `#![cfg(feature = ...)]` gates; see Phase F gate note and the chain-verify rationale in §J for the post-mortem detail).
 2. `cargo build` + `cargo test` still green (unchanged) in: primitives 0.1.1, tool 0.4.0, ai 0.16.0, sandbox, harness
 3. `grep -rn 'Extension\b' motosan-agent-loop/src/ motosan-agent-subagent/src/` returns nothing (CHANGELOG-only matches OK)
 4. `tests/permission_gating.rs` green: Deny + Allow + AskUser-approve + AskUser-deny all behave correctly
