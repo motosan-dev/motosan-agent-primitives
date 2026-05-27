@@ -453,9 +453,14 @@ Status: **ANSWERED — Option A** (ToolAnnotations in primitives)
 ### M8.5: Minimal runner for harness validation — 2-3 days [NEW]
 
 Without something to actually invoke an agent, M9's "buy 10 shares of AAPL"
-demo cannot run. Build the smallest possible runner:
+demo cannot run. Build the smallest possible runner.
 
-- New repo `motosan-dev/motosan-agent-cli` (≤300 LOC binary crate)
+**Name: `agemo`** (decided 2026-05-27 — short, brandable, no `motosan-`
+prefix to keep the binary name terse on the command line).
+
+- New repo `motosan-dev/agemo` (≤300 LOC binary crate)
+  - Crate name: `agemo`
+  - Binary name: `agemo`
   - Reads prompt from CLI arg or stdin
   - Loads a configured `Harness` and `Provider`
   - Streams `AgentEvent` as JSONL to stdout
@@ -467,8 +472,8 @@ This is **scaffolding**, not a product — it exists only so M9 has something
 to drive. A real CLI / TUI is out of scope until after 1.0.0.
 
 **Acceptance**:
-- `echo "list files in /tmp" | motosan-agent-cli --harness null` produces
-  a sensible JSONL event stream
+- `echo "list files in /tmp" | agemo --harness null` produces a sensible
+  JSONL event stream
 - Can be killed mid-run via Ctrl-C without leaving zombie processes
 
 ### M9: First harness consumer — 2-5 weeks [estimate widened]
