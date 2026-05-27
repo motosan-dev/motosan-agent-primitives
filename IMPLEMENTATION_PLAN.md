@@ -476,6 +476,49 @@ to drive. A real CLI / TUI is out of scope until after 1.0.0.
   JSONL event stream
 - Can be killed mid-run via Ctrl-C without leaving zombie processes
 
+### M8.6: LoopInterceptor refactor + Hook/Policy wiring — 2-3 weeks [NEW after M8.5]
+
+Surfaced during M8.5: the engine has zero integration with `primitives::Hook`
+and never consults `PermissionPolicy`. Without this, M9's `FinanceHarness`
+would silently bypass approval gates. Two GitHub issues filed
+([#193](https://github.com/motosan-dev/motosan-agent-loop/issues/193),
+[#194](https://github.com/motosan-dev/motosan-agent-loop/issues/194))
+turned out to mask a larger architectural cleanup.
+
+Scope (full plan in [M8_6_LOOPINTERCEPTOR_REFACTOR_PLAN.md](M8_6_LOOPINTERCEPTOR_REFACTOR_PLAN.md)):
+
+- Rename loop's `Extension` trait → `LoopInterceptor` (the name was
+  conflating "lifecycle observer" with "pipeline middleware")
+- Extract `ToolProvider` trait from `Extension` (tool registration is a
+  third concern)
+- Build `HookInterceptorAdapter` so primitives' `Hook` registers as a
+  `LoopInterceptor`
+- Add 3 new `LoopInterceptor` lifecycle methods (`on_session_start`,
+  `before_compact`, `on_subagent_stop`) so all 9 Hook methods have a
+  callsite
+- `EngineBuilder` gains `hooks(...)`, `permission_policy(...)`,
+  `memory_schema(...)` setters
+- Engine consults `PermissionPolicy` at top of `execute_tools_with_policy`;
+  `Permission::AskUser` routes through existing `AskUserAnswer` deferral
+- `motosan-agent-subagent` migrates 3 impl sites + struct renames
+- `agemo` 0.1.1 wires all 5 `Harness` fields + ships `AskOnce` demo harness
+  + stdin approval bridge
+
+**Primitives stays at 0.1.1.** Workflow + chat refactors stay deferred
+(consistent with M8 punt). New milestone slot rather than M9 prep because
+investigation revealed the scope is genuinely a refactor, not a wiring fix.
+
+**Version bumps:** motosan-agent-loop 0.23.0 → **0.24.0**,
+motosan-agent-subagent 0.2.0 → **0.3.0**, agemo 0.1.0 → **0.1.1**.
+
+**Acceptance**:
+- All 9 Hook lifecycle methods fire at expected engine callsites
+  (verified by parity test)
+- `PermissionPolicy::AskUser` end-to-end: agemo `--harness ask-once` with
+  scripted stdin approval produces the expected JSONL flow
+- All 7 existing repos still build + test green after the loop bump
+- No commit to primitives during this milestone
+
 ### M9: First harness consumer — 2-5 weeks [estimate widened]
 
 **Step 0 — M9 gate (BEFORE writing any code, 1-2 days)**:
