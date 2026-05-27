@@ -387,7 +387,7 @@ Total: **11 days focused work + 1-2 days unknown-unknowns = 12-13 days. Calendar
 6. **Wire `on_subagent_stop` invocation** per D-M86-13: at the subagent termination path (`src/subagent/driver.rs` or `manager.rs` — locate during execution), call into the loop's interceptor dispatcher `dispatch_subagent_stop(result)`. This is the callsite stub left in Phase A step 11.
 7. CHANGELOG 0.3.0 entry (BREAKING)
 
-**Gate:** `cargo build && cargo test` green in subagent.
+**Gate:** `cargo build && cargo test --features testing` green in subagent. (The `--features testing` flag is mandatory — subagent's integration tests are all `#![cfg(feature = "testing")]` gated and would trivially "pass" without the flag. This is the gap that hid the broken `opt_out_layers.rs` test post-M8 Step 4; see [motosan-agent-subagent commit `e2e50de`](https://github.com/motosan-dev/motosan-agent-subagent/commit/e2e50de).)
 
 ### Phase G — Subagent checkpoint (0.5 day) ⚠️ MANDATORY
 
@@ -417,8 +417,15 @@ From clean checkouts:
 ```bash
 for repo in motosan-agent-tool motosan-agent-loop motosan-ai/sdks/rust \
             motosan-agent-subagent motosan-sandbox motosan-agent-harness agemo; do
-  cd /Users/daiwanwei/Projects/wade/$repo && cargo build && cargo test \
-    || { echo "FAIL: $repo"; exit 1; }
+  cd /Users/daiwanwei/Projects/wade/$repo
+  if [ "$repo" = "motosan-agent-subagent" ]; then
+    # subagent integration tests are all #![cfg(feature = "testing")];
+    # without the flag they trivially "pass" with 0 tests — masks regressions.
+    cargo build && cargo test --features testing
+  else
+    cargo build && cargo test
+  fi
+  [ $? -eq 0 ] || { echo "FAIL: $repo"; exit 1; }
 done
 ```
 
@@ -426,7 +433,7 @@ All must pass. Primitives untouched (no commits).
 
 ## 6. Acceptance gates (final)
 
-1. `cargo build` + `cargo test` green in: loop 0.24.0, subagent 0.3.0, agemo 0.1.1
+1. `cargo build` + `cargo test` green in: loop 0.24.0, agemo 0.1.1. For subagent 0.3.0: `cargo build && cargo test --features testing` (the feature flag is mandatory — see Phase F gate note).
 2. `cargo build` + `cargo test` still green (unchanged) in: primitives 0.1.1, tool 0.4.0, ai 0.16.0, sandbox, harness
 3. `grep -rn 'Extension\b' motosan-agent-loop/src/ motosan-agent-subagent/src/` returns nothing (CHANGELOG-only matches OK)
 4. `tests/permission_gating.rs` green: Deny + Allow + AskUser-approve + AskUser-deny all behave correctly
