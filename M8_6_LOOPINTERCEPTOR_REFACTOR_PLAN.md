@@ -168,7 +168,7 @@ Hard constraint. Primitives has been the frozen contract since M6. The whole poi
 
 This means policy is the outermost authority. Consistent with primitives D3 "most-restrictive wins" — interceptors cannot weaken the policy's decision.
 
-### D-M86-14. Three new `LoopInterceptor` lifecycle methods (Hook coverage)
+### D-M86-13. Three new `LoopInterceptor` lifecycle methods (Hook coverage)
 
 `Harness::hooks()` returns `Vec<Arc<dyn Hook>>` and Hook has 9 lifecycle methods, but `LoopInterceptor` today only has callsites for 6 of them. The remaining 3 — `session_start`, `pre_compact`, `subagent_stop` — would be silently dead if HookInterceptorAdapter wraps a Hook that implements them, because nothing in the engine would invoke the wrapped method.
 
@@ -187,7 +187,7 @@ The adapter then forwards:
 
 All 3 are additive — zero impact on existing 37 LoopInterceptor impls (they get default no-op behavior). The `on_subagent_stop` callsite requires a one-line change in subagent's termination path during Phase F to invoke the dispatcher.
 
-### D-M86-13. Versioning
+### D-M86-14. Versioning
 
 | Crate | Old | New | Reason |
 |---|---|---|---|
@@ -306,7 +306,7 @@ Total: **11 days focused work + 1-2 days unknown-unknowns = 12-13 days. Calendar
    - `src/extensions/ask_user/extension.rs:279` — `AskUserExtension::tool_defs`
    - `src/extensions/planning/extension.rs:65` — `PlanningExtension::tool_defs`
    - (Subagent's `SubagentExtension::tool_defs` is handled in Phase F, not here. `engine.rs:146` has `fn tool_defs(&self) -> &[ToolDef]` but it is an engine-internal method with a different signature — unaffected.)
-10. **Add 3 new `LoopInterceptor` lifecycle methods** per D-M86-14:
+10. **Add 3 new `LoopInterceptor` lifecycle methods** per D-M86-13:
     - `on_session_start(&mut self, ctx)` with default no-op
     - `before_compact(&mut self, ctx, msgs)` with default no-op
     - `on_subagent_stop(&mut self, ctx, result)` with default no-op
@@ -321,7 +321,7 @@ Total: **11 days focused work + 1-2 days unknown-unknowns = 12-13 days. Calendar
 
 1. Create `src/core/hook_adapter.rs` with `HookInterceptorAdapter`.
 2. Add `ToolDecision::Abort { reason }` variant in `decision.rs` (per D-M86-5).
-3. Implement `LoopInterceptor for HookInterceptorAdapter` with the full 9-method mapping per D-M86-5 + D-M86-14:
+3. Implement `LoopInterceptor for HookInterceptorAdapter` with the full 9-method mapping per D-M86-5 + D-M86-13:
    - `pre_tool_use` → `intercept_tool_call` (per the HookResult→ToolDecision table in D-M86-5)
    - `post_tool_use` / `post_tool_use_failure` → `after_tool_result` (branch on `is_error`)
    - `user_prompt_submit` → `before_iteration`
@@ -384,7 +384,7 @@ Total: **11 days focused work + 1-2 days unknown-unknowns = 12-13 days. Calendar
 3. `src/subagent/extension.rs` → rename file to `interceptor.rs`; `SubagentExtension` → `SubagentInterceptor`; **split `tool_defs` into separate `impl ToolProvider for SubagentInterceptor`**
 4. `src/lib.rs` re-export renames: `DelegationInterceptor`, `SubagentInterceptor`
 5. `tests/opt_out_layers.rs` → `DenyAllSpawnsExtension` → `DenyAllSpawnsInterceptor`
-6. **Wire `on_subagent_stop` invocation** per D-M86-14: at the subagent termination path (`src/subagent/driver.rs` or `manager.rs` — locate during execution), call into the loop's interceptor dispatcher `dispatch_subagent_stop(result)`. This is the callsite stub left in Phase A step 11.
+6. **Wire `on_subagent_stop` invocation** per D-M86-13: at the subagent termination path (`src/subagent/driver.rs` or `manager.rs` — locate during execution), call into the loop's interceptor dispatcher `dispatch_subagent_stop(result)`. This is the callsite stub left in Phase A step 11.
 7. CHANGELOG 0.3.0 entry (BREAKING)
 
 **Gate:** `cargo build && cargo test` green in subagent.
