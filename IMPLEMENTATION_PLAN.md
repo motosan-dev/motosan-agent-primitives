@@ -591,8 +591,16 @@ This is the mitigation for the "Harness model is structurally wrong" risk
 
 **Step 1 — Implementation (after gate passes)**:
 
-- Build `motosan-agent-harness-finance` (separate repo, depends on
-  `motosan-agent-harness`)
+- **Convert `motosan-agent-harness` to a Cargo workspace** and add
+  `motosan-agent-harness-finance` as a sub-crate within it (decision
+  2026-05-28, replaces the original "separate repo" stance). Existing
+  `motosan-agent-harness` package stays at the workspace root so
+  consumers (loop, subagent) need no path changes. Future verticals
+  (rental in M11, healthcare etc) join as additional sub-crates.
+  Rationale: cross-vertical refactor when Harness trait evolves is a
+  single PR; matches Rust ecosystem norm (tokio / serde / bevy use the
+  same pattern); no per-crate publish penalty (workspace crates publish
+  independently).
 - Implement 3-5 finance tools (`get_quote`, `get_position`, `place_order`,
   `backtest`)
 - Implement `FinanceApprovalPolicy` (place_order needs confirmation,
@@ -600,14 +608,18 @@ This is the mitigation for the "Harness model is structurally wrong" risk
 - Implement `AuditLogHook` (logs every tool call to file; overrides both
   `post_tool_use` and `post_tool_use_failure` per D2-B)
 - Implement `FinanceHarness::system_prompt` (domain persona)
+- Wire `agemo --harness finance` as the demo entry point
 - **Document every place where primitives or Harness trait felt awkward** —
   these become M10 inputs
 
 **Acceptance**:
 - `M9_GATE_DIAGRAM.md` exists and passes inspection (no missing concepts)
+- `motosan-agent-harness` is now a Cargo workspace; existing consumers
+  (loop, subagent, agemo) still compile against it unchanged
 - A demo where the agent does "buy 10 shares of AAPL if it's under $200"
-  works end-to-end
-- The "awkwardness list" has ≥3 concrete items
+  works end-to-end via `agemo --harness finance`
+- The "awkwardness list" has ≥3 concrete items (the M9 gate already
+  surfaced 6 candidates in `M9_GATE_DIAGRAM.md §5`; Step 1 may discover more)
 
 ### M10: Refactor based on consumer feedback — 1-2 weeks
 
@@ -620,15 +632,23 @@ rationale; finance harness migrated to 0.2.0.
 
 ### M11: Second harness validates → freeze 0.1.0 → publish — 1 week
 
-- Build `motosan-agent-harness-rental` against 0.2.0
-- If it surfaces NEW primitives changes, bump to 0.3.0 and migrate finance
+- Add `motosan-agent-harness-rental` as a new sub-crate inside the
+  `motosan-agent-harness` workspace (per M9 Step 1 decision; was originally
+  scoped as a separate repo)
+- If it surfaces NEW primitives changes, bump primitives + harness to
+  0.3.0 and migrate finance
 - If it works clean → freeze API → bump to 1.0.0
-- Publish `motosan-agent-primitives` + `motosan-agent-harness` to crates.io
-- Tag GitHub releases with CHANGELOG
+- Publish `motosan-agent-primitives`, `motosan-agent-harness`,
+  `motosan-agent-harness-finance`, `motosan-agent-harness-rental` to
+  crates.io. Workspace sub-crates publish independently with their own
+  versions
+- Tag GitHub releases with CHANGELOG (one per crate or one combined)
 
 **Acceptance**:
-- `cargo publish` succeeds for both crates
+- `cargo publish` succeeds for primitives + each workspace crate
 - Both finance and rental harnesses compile against published versions
+- Workspace remains structurally consistent (sub-crates can be added
+  without touching root or existing siblings)
 
 ---
 
