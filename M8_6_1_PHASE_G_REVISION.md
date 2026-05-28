@@ -2,7 +2,17 @@
 
 **Date:** 2026-05-28
 **Parent:** [M8.6.1 plan §G / D-861-5](M8_6_1_PATH_UNIFICATION_PLAN.md)
-**Status:** Awaiting approval — replaces the original D-861-5 design
+**Status:** Shipped (subagent 0.3.2 → see §0.5 amendment for 0.4.0 follow-up)
+
+---
+
+## 0.5. Post-execution amendment (2026-05-28, after β shipped)
+
+After β refactor landed in subagent 0.3.2 (commit a9a44a4), close-out review surfaced that the `subagent_stop_fires_on_natural_completion` test only exercised the dispatch pipeline (manual `record_termination(.., Completed, ..)` call), not any real "child driver naturally completes" code path. Investigation of OpenAI Codex CLI's `multi_agents/agent/status.rs` confirmed Codex's `Completed` is per-turn (triggered by `TurnComplete` event), a different semantic from Motosan's parent-driven `wait_agent` / `send_message` / `close_agent` model — which has no equivalent natural-completion trigger.
+
+**Decision:** removed `SubagentStatus::Completed` variant entirely in subagent 0.4.0 (commits 768350d + e09900f). The variant was a "ghost" — defined in the enum but never auto-fired by production code. Long-term maintainability principle: API surface should reflect current real semantics, not aspirational ones.
+
+**References in this plan to `Completed` are historical** (e.g. D-PG-3 row "Child LLM emits TurnComplete → Completed", §2 audit table claim that `Completed` variant exists, Q-PG-1 about carrying final_message on Completed). All are obsoleted by the 0.4.0 removal. If a real per-turn completion signal is wanted later, design it then with a concrete trigger — additive change at that point.
 
 ---
 
