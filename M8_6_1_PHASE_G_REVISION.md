@@ -207,7 +207,7 @@ tokio::spawn(child_driver(
 
 When the recover/restart machinery transitions a child to `Suspended`, it writes the status but emits NO event. The interceptor's hook is silent. When the same child later resumes (status → `Running` again), still no event. Only when it FINALLY transitions to a terminal state does Terminated fire.
 
-## 4. Implementation steps (1.5 days total)
+## 4. Implementation steps (2 days total — was 1.5, +0.5 for D-PG-8 channel work)
 
 ### Step 1 — Add `SubagentEvent::Terminated` + `is_terminal` helper (2h)
 
@@ -216,19 +216,32 @@ When the recover/restart machinery transitions a child to `Suspended`, it writes
 - `src/subagent/stop_derivation.rs` (new file): `derive_subagent_stop` function
 - Tests for derive function + is_terminal (~5 cases each)
 
-### Step 2 — Emit Terminated from manager paths (4h)
+### Step 2 — Add per-subagent event channel infrastructure (D-PG-8) (3h)
 
-Audit the 4 manager-side terminal-status writes (manager.rs:359-362, 790-796) and migrate each to use `emit_terminated_once`. Test by capturing emitted events.
+- Manager: in each subagent-spawn site (manager.rs:187/710/820/920), create `mpsc::channel::<SubagentEvent>(16)`. Store receiver per-subagent in the existing per-subagent state struct (keyed by session_id).
+- Driver: extend `child_driver` signature to accept `subagent_event_tx: mpsc::Sender<SubagentEvent>`.
+- SubagentInterceptor: gain access to the receiver map (Arc<Mutex<HashMap<SessionId, mpsc::Receiver<SubagentEvent>>>>). Add `drain_and_dispatch_terminations(ctx)` helper per D-PG-5.
+- **Unit test**: driver sends Terminated into channel; receiver-side test asserts derive + notify behavior in isolation (no full engine roundtrip).
 
-### Step 3 — Emit Terminated from driver paths (4h)
+### Step 3 — Emit Terminated from driver paths via the new channel (3h)
 
-Audit driver.rs:67, 81-83 + handle.rs:32. Classify each per D-PG-3 table. Wire driver to use `emit_terminated_once` for terminal exits; skip emission for Suspended exit. Critical: **distinguish parent-cancel-induced exit (manager already emitted) from driver-natural-exit (driver should emit)** — use the watch channel as the source of truth via D-PG-6's CAS.
+Audit driver.rs:67, 81-83 + handle.rs:32. Classify each per D-PG-3 table. Driver calls `subagent_event_tx.try_send(SubagentEvent::Terminated { ... })` for terminal exits; skip emission for Suspended exit. Use local `bool emitted_terminal` to prevent double-emit if multiple driver code paths converge.
 
-### Step 4 — Wire SubagentInterceptor to call derive + notify (2h)
+### Step 4 — Emit Terminated from manager close paths via the same channel (2h)
 
-Find where SubagentInterceptor currently observes SubagentEvent (likely an existing emit/forward path). Add `derive_subagent_stop` call + `ctx.notify_subagent_stop` on terminal events.
+Migrate the 4 manager-side terminal-status writes (manager.rs:359-362, 790-796) to push into the same per-subagent event channel. Manager-side idempotency guard: check current `SubagentStatus` via `status_tx.borrow()` before emitting — if already terminal, skip (per D-PG-6).
 
-### Step 5 — Integration tests (4h)
+### Step 5 — Wire `drain_and_dispatch_terminations` into SubagentInterceptor lifecycle methods (2h)
+
+Add `self.drain_and_dispatch_terminations(ctx)` as the first line of:
+- `intercept_tool_call`
+- `after_tool_result`
+- `on_terminal`
+- (and any other lifecycle method the engine actually invokes — verify by grep)
+
+This guarantees that any driver-emitted termination is dispatched on the parent's next tick.
+
+### Step 6 — Integration tests (4h)
 
 Per subagent#1 acceptance:
 - `subagent_stop_fires_on_natural_completion` — child driver returns TurnComplete → Hook sees Completed
