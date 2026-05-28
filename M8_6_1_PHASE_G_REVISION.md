@@ -120,9 +120,9 @@ pub(crate) fn derive_subagent_stop(event: &SubagentEvent) -> Option<SubagentResu
 
 Pure function. Test in isolation. Easy to extend with new event variants.
 
-### D-PG-5. Hook dispatch via the new event channel (driven by D-PG-8)
+### D-PG-5. Hook dispatch via the new event channel (driven by D-PG-7)
 
-`SubagentInterceptor`'s lifecycle methods (which DO have HookCtx) drain the subagent event channel introduced in D-PG-8, derive stop notifications, and dispatch:
+`SubagentInterceptor`'s lifecycle methods (which DO have HookCtx) drain the subagent event channel introduced in D-PG-7, derive stop notifications, and dispatch:
 
 ```rust
 // In SubagentInterceptor::intercept_tool_call, after_tool_result, on_terminal — every entry
@@ -138,7 +138,7 @@ fn drain_and_dispatch_terminations(&mut self, ctx: &mut HookCtx<'_>) {
 
 Drain on EVERY interceptor lifecycle entry — `intercept_tool_call`, `after_tool_result`, `on_terminal`, `before_iteration`. This guarantees that as soon as the parent's next interceptor tick happens, any driver-emitted terminations are dispatched.
 
-**Critical correction from initial plan draft:** the original D-PG-5 claimed "existing event pipeline" — that was wrong. `ctx.emit()` requires HookCtx, which driver tasks don't have. We need a new HookCtx-free sender (D-PG-8) to bridge.
+**Critical correction from initial plan draft:** the original D-PG-5 claimed "existing event pipeline" — that was wrong. `ctx.emit()` requires HookCtx, which driver tasks don't have. We need a new HookCtx-free sender (D-PG-7) to bridge.
 
 ### D-PG-6. Idempotency at emit (status_tx CAS guard)
 
@@ -148,7 +148,7 @@ Driver and manager paths MUST NOT both emit Terminated for the same session. Bot
 // helper used by both driver and manager close paths
 fn emit_terminated_once(
     status_tx: &watch::Sender<SubagentStatus>,
-    event_tx: &mpsc::Sender<SubagentEvent>,  // from D-PG-8
+    event_tx: &mpsc::Sender<SubagentEvent>,  // from D-PG-7
     new_terminal: SubagentStatus,
     stop_reason: StopReason,
     final_message: Option<Message>,
@@ -165,13 +165,13 @@ fn emit_terminated_once(
         stop_reason,
         final_message,
     });
-    // If event_tx is dropped (receiver gone), event is lost — acceptable per D-PG-8 backpressure note.
+    // If event_tx is dropped (receiver gone), event is lost — acceptable per D-PG-7 backpressure note.
 }
 ```
 
 Compare-and-swap on the watch channel + try_send to the event channel. No locks, no Mutex queue.
 
-### D-PG-8. Driver-to-dispatcher transport — new `mpsc::Sender<SubagentEvent>` per subagent
+### D-PG-7. Driver-to-dispatcher transport — new `mpsc::Sender<SubagentEvent>` per subagent
 
 **Source of the prior plan's gap:** driver tasks have no HookCtx, so they cannot call `ctx.emit()`. They need a HookCtx-free channel to write into. This mirrors Codex's `tx_event: mpsc::Sender<EventMsg>` at `session/mod.rs:607`.
 
@@ -203,11 +203,11 @@ tokio::spawn(child_driver(
 
 **Idempotency** (replaces D-PG-6's CAS approach): mpsc preserves send order; we use a `bool already_terminated` flag on the driver side to guard against double-emit. Manager's close path uses the watch channel's current value as the guard (status already terminal → skip). Either way, channel can't deliver duplicates because either driver-side or manager-side guards prevent the second send.
 
-### D-PG-7. Suspend path explicitly does NOT emit Terminated
+### D-PG-8. Suspend path explicitly does NOT emit Terminated
 
 When the recover/restart machinery transitions a child to `Suspended`, it writes the status but emits NO event. The interceptor's hook is silent. When the same child later resumes (status → `Running` again), still no event. Only when it FINALLY transitions to a terminal state does Terminated fire.
 
-## 4. Implementation steps (2 days total — was 1.5, +0.5 for D-PG-8 channel work)
+## 4. Implementation steps (2 days total — was 1.5, +0.5 for D-PG-7 channel work)
 
 ### Step 1 — Add `SubagentEvent::Terminated` + `is_terminal` helper (2h)
 
@@ -216,7 +216,7 @@ When the recover/restart machinery transitions a child to `Suspended`, it writes
 - `src/subagent/stop_derivation.rs` (new file): `derive_subagent_stop` function
 - Tests for derive function + is_terminal (~5 cases each)
 
-### Step 2 — Add per-subagent event channel infrastructure (D-PG-8) (3h)
+### Step 2 — Add per-subagent event channel infrastructure (D-PG-7) (3h)
 
 - Manager: in each subagent-spawn site (manager.rs:187/710/820/920), create `mpsc::channel::<SubagentEvent>(16)`. Store receiver per-subagent in the existing per-subagent state struct (keyed by session_id).
 - Driver: extend `child_driver` signature to accept `subagent_event_tx: mpsc::Sender<SubagentEvent>`.
@@ -226,6 +226,8 @@ When the recover/restart machinery transitions a child to `Suspended`, it writes
 ### Step 3 — Emit Terminated from driver paths via the new channel (3h)
 
 Audit driver.rs:67, 81-83 + handle.rs:32. Classify each per D-PG-3 table. Driver calls `subagent_event_tx.try_send(SubagentEvent::Terminated { ... })` for terminal exits; skip emission for Suspended exit. Use local `bool emitted_terminal` to prevent double-emit if multiple driver code paths converge.
+
+**Removed by this step:** the existing `pending_stops: Arc<Mutex<Vec<SubagentResult>>>` field at `driver.rs:297` and the `record_driver_termination()` helper — both are the half-built workaround that β replaces. Driver no longer carries a Mutex queue; it just sends into the mpsc channel from D-PG-7.
 
 ### Step 4 — Emit Terminated from manager close paths via the same channel (2h)
 
@@ -260,7 +262,8 @@ Per subagent#1 acceptance:
 - `cargo test --all-features` in loop still green (no regression in loop tests that exercise subagent through interceptors)
 - subagent#1 closed with commit SHA reference
 - No primitives commit (D-861-8 still holds)
-- No new mpsc/oneshot channels added — Terminated rides the existing SubagentEvent stream
+- One new mpsc channel added per subagent (Codex `tx_event` pattern, per D-PG-7) — replaces the existing `pending_stops` Mutex
+- **No `pending_stops` Mutex remains in driver.rs** — grep `pending_stops` in subagent src must return empty post-refactor. The old workaround is fully obsoleted by the channel.
 
 ## 6. What this revision does NOT change
 
