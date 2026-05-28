@@ -1,7 +1,7 @@
 # M8.6 — LoopInterceptor refactor + close #193/#194
 
 **Date:** 2026-05-27
-**Repos touched:** `motosan-agent-loop` (0.23.0 → 0.24.0), `motosan-agent-subagent` (0.2.0 → 0.3.0), `agemo` (0.1.0 → 0.1.1)
+**Repos touched:** `motosan-agent-loop` (0.23.0 → 0.24.0), `motosan-agent-subagent` (0.2.0 → 0.3.0), `agemo` (0.1.0 → 0.1.1), `motosan-sandbox` (test-only patch — see note below)
 **Parent issues:** [#193](https://github.com/motosan-dev/motosan-agent-loop/issues/193), [#194](https://github.com/motosan-dev/motosan-agent-loop/issues/194)
 **Position in roadmap:** new milestone between [M8.5](M8_5_AGEMO_PLAN.md) (done) and M9 (blocked on this)
 **Estimated effort:** 2-3 weeks (12-13 focused days)
@@ -194,7 +194,10 @@ All 3 are additive — zero impact on existing 37 LoopInterceptor impls (they ge
 | motosan-agent-loop | 0.23.0 | **0.24.0** | trait rename + additions (minor: existing impls migrate via rename, no semantic break) |
 | motosan-agent-subagent | 0.2.0 | **0.3.0** | struct renames + trait migration (breaking public API) |
 | agemo | 0.1.0 | **0.1.1** | additive (5-field wiring + AskOnce harness) |
-| primitives, tool, ai, sandbox, harness | unchanged | — | not touched |
+| motosan-sandbox | (patch) | **patch** | test-only: `loop_integration.rs` Extension → LoopInterceptor (see scope note) |
+| primitives, tool, ai, harness | unchanged | — | not touched |
+
+**Scope note — 4th repo (sandbox).** The original plan listed 3 edit targets based on the M8 audit, which classified `motosan-sandbox` as "Trivial: 1 Tool impl" and **missed** the 2 `impl Extension` blocks in `crates/motosan-sandbox/tests/loop_integration.rs` (`SandboxApprovalExtension`, `DeferGateExtension`). The D-M86-2 trait rename ripples to any `impl Extension`, so sandbox's test file needed a mechanical 3-line migration to compile against loop 0.24.0. This is test-only — sandbox's production code and public API are unchanged. Applied as [motosan-sandbox commit `c667463`](https://github.com/daiwanwei/motosan-sandbox/commit/c667463). Not real scope expansion; correcting an audit undercount.
 
 ## 4. Cross-repo file layout
 
