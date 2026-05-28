@@ -519,6 +519,60 @@ motosan-agent-subagent 0.2.0 → **0.3.0**, agemo 0.1.0 → **0.1.1**.
 - All 7 existing repos still build + test green after the loop bump
 - No commit to primitives during this milestone
 
+### M8.6.1: Tool execution path unification — 1.5-2 weeks [NEW after M8.6]
+
+Surfaced during M8.6 close-out review: the middleware (PermissionPolicy /
+LoopInterceptor / Hooks) was wired at ONE tool-dispatch entry point
+(`execute_tools_with_policy`), but the engine has other paths that bypass
+it entirely — most critically the streaming eager-execution path
+(`StreamingToolExecutor::submit`), which is what `agemo` actually uses
+to produce JSONL output. Net effect: tests pass, but the M8.6 wiring is
+silently inert in real use. M9's FinanceApprovalPolicy would be
+bypassed → real money could move without approval.
+
+Scope (full plan in [M8_6_1_PATH_UNIFICATION_PLAN.md](M8_6_1_PATH_UNIFICATION_PLAN.md)):
+
+- New unified `dispatch_tool_call` in `src/core/dispatch.rs` — the ONLY
+  path to `tool.call()`, encapsulating permission check + interceptor
+  chain + deferral resolution + result-rewrite chain
+- Refactor `StreamingToolExecutor::submit` to route through the unified
+  pipeline (chain runs inline at submit time; only `tool.call()` runs
+  in the spawned task)
+- 1-line fix to `HookInterceptorAdapter::map_hook_result` so
+  `HookResult::Continue { updated_input }` propagates through the Hook
+  chain instead of terminating it
+- Migrate `PlanningTool::call`'s inner `block_on(tool.call(...))` to
+  `block_on(dispatch_tool_call(...))` so sub-tools are gated
+- Replace inline `rx.recv().await` in permission AskUser with
+  `ToolDecision::Defer` so one Ask doesn't block the whole batch
+  (closes [motosan-agent-loop#195](https://github.com/motosan-dev/motosan-agent-loop/issues/195))
+- Route all 6 unguarded subagent termination paths through
+  `on_subagent_stop` via a single status-transition gate
+  (closes [motosan-agent-subagent#1](https://github.com/motosan-dev/motosan-agent-subagent/issues/1))
+- Add **architectural invariant tests** (`tests/architectural_invariants.rs`)
+  that grep-assert no `tool.call()` bypass exists — prevents regression
+
+**Primitives stays at 0.1.1.** Same D-M86-10 invariant continues.
+Workflow + chat remain deferred. This milestone exists because M8.6's
+acceptance gates were entry-point-specific rather than architectural;
+the M8.6.1 invariant tests close that meta-gap.
+
+**Version bumps:** motosan-agent-loop 0.24.0 → **0.25.0**,
+motosan-agent-subagent 0.3.0 → **0.3.1**, agemo unchanged.
+
+**Acceptance**:
+- Streaming permission test green (proves PermissionPolicy fires on
+  streaming path)
+- Parallel batch test green (proves AskUser-deferred tool doesn't block
+  siblings)
+- Multi-hook chain test green (proves Hook `updated_input` rewrites
+  propagate through the chain)
+- Architectural invariant test green (no `tool.call()` outside the
+  unified dispatch module)
+- All 8 repos build + test green (including 5 subagent termination tests
+  closing subagent#1)
+- No commit to primitives during this milestone
+
 ### M9: First harness consumer — 2-5 weeks [estimate widened]
 
 **Step 0 — M9 gate (BEFORE writing any code, 1-2 days)**:
