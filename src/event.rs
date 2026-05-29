@@ -218,10 +218,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
             },
         };
-        assert_eq!(
-            serde_json::to_value(&end).unwrap()["event"],
-            "message_end"
-        );
+        assert_eq!(serde_json::to_value(&end).unwrap()["event"], "message_end");
         assert_eq!(round_trip(&start), start);
         assert_eq!(round_trip(&end), end);
     }

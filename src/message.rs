@@ -403,7 +403,9 @@ mod tests {
     #[test]
     fn content_block_json_serde_tag() {
         use serde_json::json;
-        let cb = ContentBlock::Json { value: json!({"k": 1}) };
+        let cb = ContentBlock::Json {
+            value: json!({"k": 1}),
+        };
         let v = serde_json::to_value(&cb).unwrap();
         assert_eq!(v["type"], "json");
         // value is the JSON tree itself, not a string:

@@ -65,12 +65,18 @@ hooks should `select!` against `cancelled().await`.
 
 The lifecycle has **nine** events. `post_tool_use` fires on success;
 `post_tool_use_failure` is a separate event fired on tool error,
-cancellation, or timeout — audit hooks should override both.
+cancellation, or timeout — audit hooks should override both. Since v0.2.0,
+`PostToolUseFailureCtx` includes `result: ToolResult`, the same wire shape the
+model sees, so audit hooks no longer need to synthesize a result from the
+failure enum.
 
 ## Permission modes — important contract
 
-`PermissionMode::Plan` denies only tools whose `ToolAnnotations.destructive`
-is `true`. Read-only and network-accessing tools are allowed (decision
+`PermissionContext` includes `recent_messages: &[Message]` since v0.2.0 so
+policies can inspect the conversation window when deciding or rendering an
+approval prompt. `PermissionMode::Plan` denies only tools whose
+`ToolAnnotations.destructive` is `true`. Read-only and network-accessing tools
+are allowed (decision
 D4 = C, more permissive than the original proposal). This means **tool
 authors must annotate `destructive` accurately** — a tool that performs
 a network mutation but declares `destructive: false` will run in plan

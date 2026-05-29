@@ -11,14 +11,24 @@ Copy each phase verbatim into a fresh sub-agent. Run them **in order** (Phase N 
 
 **Inter-phase verification:**
 ```
-cd <repo> && git log -1 --oneline && cargo build --locked && cargo test
+cd <repo> && git log -1 --oneline && cargo build --locked --all-features && cargo test --locked --all-features
 ```
+⚠️ For any **Cargo workspace** repo (currently `motosan-agent-harness`: root crate + `finance` member), plain `cargo test` only tests the package in the cwd and SILENTLY SKIPS other members. Always use `cargo test --workspace --locked --all-features` there, or finance's migration tests never run. (Caught in Phase F review: the failure-path + policy tests were skipped by the non-`--workspace` command even though they were correct.)
 
-**Chain-verify after Phase H:**
+**Chain-verify after Phase H** (paths differ per repo — ai lives at `motosan-ai/sdks/rust`, agemo at `agemo`, the rest under `motosan-agent-*`):
 ```
+set -e
+declare -A DIR=(
+  [primitives]=motosan-agent-primitives [tool]=motosan-agent-tool
+  [loop]=motosan-agent-loop [ai]=motosan-ai/sdks/rust
+  [subagent]=motosan-agent-subagent [harness]=motosan-agent-harness
+  [sandbox]=motosan-sandbox [agemo]=agemo
+)
 for r in primitives tool loop ai subagent harness sandbox agemo; do
-  echo "=== $r ===" && cd /Users/daiwanwei/Projects/wade/motosan-agent-$r && \
-    git log -1 --oneline && cargo build --locked && cargo test
+  echo "=== $r ===" && cd "/Users/daiwanwei/Projects/wade/${DIR[$r]}" && git log -1 --oneline
+  # harness is a workspace → --workspace is REQUIRED to test the finance member
+  if [ "$r" = harness ]; then ws="--workspace"; else ws=""; fi
+  cargo build --locked --all-features && cargo test $ws --locked --all-features
 done
 ```
 

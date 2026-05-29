@@ -447,8 +447,8 @@ mod tests {
     use super::*;
     use crate::message::Role;
     use serde_json::json;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
 
     /// Object-safety smoke test.
     #[allow(dead_code)]
@@ -553,9 +553,7 @@ mod tests {
         for r in [
             StopReason::Completed,
             StopReason::UserCancelled,
-            StopReason::AbortedByHook {
-                reason: "x".into(),
-            },
+            StopReason::AbortedByHook { reason: "x".into() },
             StopReason::BudgetExhausted,
             StopReason::Error {
                 message: "boom".into(),

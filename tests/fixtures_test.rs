@@ -20,22 +20,34 @@ fn text_fixture_parses() {
 
 #[test]
 fn image_base64_fixture_parses() {
-    assert!(matches!(parse("image_base64.json"), ContentBlock::Image { .. }));
+    assert!(matches!(
+        parse("image_base64.json"),
+        ContentBlock::Image { .. }
+    ));
 }
 
 #[test]
 fn image_url_fixture_parses() {
-    assert!(matches!(parse("image_url.json"), ContentBlock::Image { .. }));
+    assert!(matches!(
+        parse("image_url.json"),
+        ContentBlock::Image { .. }
+    ));
 }
 
 #[test]
 fn document_fixture_parses() {
-    assert!(matches!(parse("document.json"), ContentBlock::Document { .. }));
+    assert!(matches!(
+        parse("document.json"),
+        ContentBlock::Document { .. }
+    ));
 }
 
 #[test]
 fn tool_use_fixture_parses() {
-    assert!(matches!(parse("tool_use.json"), ContentBlock::ToolUse { .. }));
+    assert!(matches!(
+        parse("tool_use.json"),
+        ContentBlock::ToolUse { .. }
+    ));
 }
 
 #[test]
