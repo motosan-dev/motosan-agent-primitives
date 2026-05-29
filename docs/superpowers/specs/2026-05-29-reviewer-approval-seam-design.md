@@ -64,7 +64,7 @@ pub struct ApprovalRequest {
     pub cancellation_token: CancellationToken,  // review() MUST observe this
 }
 
-pub enum ReviewDecision { Approve, Deny }
+pub enum ReviewDecision { Approve, Deny { reason: String } }  // Deny carries a reason (mirrors Permission::Deny)
 ```
 
 **Rule:** when the composed policy returns `AskUser`, the loop/manager calls `session.reviewer.review(req).await` for the final verdict. When it returns `Allow`/`Deny`, the reviewer is never consulted.

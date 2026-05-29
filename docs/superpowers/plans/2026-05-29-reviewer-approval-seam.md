@@ -23,6 +23,8 @@ This feature spans four crates with a strict dependency order. It is **one coher
 
 > **Granularity calibration (deliberate, not a placeholder):** Phase 1 is fine-grained TDD. Phases 2–4 are written at task level (exact files, signatures, code sketches, test intent) because they touch `motosan-agent-loop` internals that are in active flux (primitives just moved 0.2.0→0.3.0 during design) and the spec gates them **post-M11**. When a phase is actually picked up, re-read the then-current `engine.rs` / `permission_runtime.rs` and expand its tasks into TDD micro-steps against the real code.
 
+**Out of scope for this plan (P5):** `GuardianReviewer` and composite/escalating reviewers are **user-land impls** (a host or vertical writes them against the `Reviewer` trait — spec §4 Tier 3 shows them as usage examples, not framework deliverables). This plan ships only the framework pieces: the trait + types (Phase 1), the `DenyReviewer` default and `DeferredAskUserReviewer` (Phase 2), inheritance sugar (Phase 3), and the agemo migration (Phase 4). If a built-in guardian is later wanted, it is a separate plan. The guardian-recursion guard (spec §4 F4) is still documented in Task 8 because the inheritance sugar must not be misused when someone *does* build a guardian.
+
 **Do not start before M11** (rental harness → 1.0 freeze), per the spec §14.
 
 ---
@@ -107,19 +109,14 @@ mod tests {
 
 > Note: `ReviewDecision::Deny { reason }` (not a bare `Deny`) so a reviewer can explain itself to the model, matching `Permission::Deny`. The spec sketched `Deny` bare; this is the resolved, richer shape — update the spec's §3 sketch when implementing.
 
-- [ ] **Step 2: Wire the module.** In `src/lib.rs` add `pub mod approval;` and extend the crate-root re-export to include `pub use approval::{ApprovalRequest, ReviewDecision, Reviewer};` (match the existing `pub use permission::{...}` style). It will not compile yet (`ApprovalRequest`/`Reviewer` undefined) — that is expected; Tasks 2–3 add them.
+- [ ] **Step 2: Wire the module.** In `src/lib.rs` add `pub mod approval;` and `pub use approval::ReviewDecision;` only (Tasks 2–3 extend the re-export to add `ApprovalRequest` then `Reviewer`). Match the existing `pub use permission::{...}` style. (Do not re-export not-yet-defined items — no failing-then-narrowing dance.)
 
-- [ ] **Step 3: Run the test, expect compile failure** (missing `ApprovalRequest`/`Reviewer` in re-export).
-
-Run: `cargo test -p motosan-agent-primitives approval::`
-Expected: FAIL to compile (`cannot find ... ApprovalRequest`).
-
-- [ ] **Step 4: Temporarily narrow the re-export** to `pub use approval::ReviewDecision;` so Task 1 builds green in isolation.
+- [ ] **Step 3: Run the test, expect PASS**
 
 Run: `cargo test -p motosan-agent-primitives approval::tests::review_decision_round_trips`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add src/approval.rs src/lib.rs
@@ -155,15 +152,16 @@ mod request_tests {
         }
     }
 
-    #[test]
+    #[test] // no runtime needed — pure ownership/clone checks
     fn approval_request_is_cloneable_and_retains_data() {
         let req = sample_request();
-        let copy = req.clone();                         // fan-out composites clone it
+        let copy = req.clone();                          // fan-out composites clone it
         assert_eq!(copy.tool_call.name, "place_order");
-        assert_eq!(copy.recent_messages.len(), 1);
-        assert_eq!(copy.prompt.as_deref(), Some("Approve buying 10 AAPL?"));
-        // owned → can be moved into a 'static task (compile-time proof)
-        let _moved = tokio::spawn(async move { req.session_id });
+        assert_eq!(req.recent_messages.len(), 1);        // original still usable after clone
+        assert_eq!(req.prompt.as_deref(), Some("Approve buying 10 AAPL?"));
+        // owned → Send + 'static (compile-time proof, NO tokio runtime)
+        fn _assert_send_static<T: Send + 'static>() {}
+        _assert_send_static::<ApprovalRequest>();
     }
 }
 ```
@@ -319,8 +317,9 @@ Grounding (verified in current `motosan-agent-loop`):
 **Files:** Modify `engine.rs` (the `consult_policy` match ~L3557) and add a per-session approval mutex.
 
 - Replace the inline `AskUser { prompt }` arm's event/defer logic with: build an `ApprovalRequest` (via a new `permission_runtime::approval_request_from(...)` helper that owns/clones `tool_call`, `annotations`, `session_id`, the `recent_messages_owned` already computed above, and `prompt`, plus the engine's `cancellation_token`), then `self.reviewer.review(req).await`, mapping `Approve` → the same path as `Allow` (emit ToolStarted + dispatch) and `Deny { reason }` → the same resolved-error slot as the `Deny` arm.
-- Wrap the `review()` call in a **per-session approval mutex** (`tokio::sync::Mutex` on the Engine) so concurrent escalations in a parallel batch serialize (spec §7 F2). The `DeferredAskUserReviewer` then naturally drives the existing event/defer/ops path one at a time.
-- **Tests:** (a) policy `AskUser` + `AlwaysApprove` reviewer → tool runs; (b) `AskUser` + default `DenyReviewer` → blocked; (c) a parallel batch where two calls escalate → assert the reviewer is entered serially (e.g. a recording reviewer asserts no overlap). Reuse `tests/permission_parallel_batch.rs` patterns.
+- **Serialization lives in the shared resource, NOT the Engine (P3).** The approval mutex must guard the *answering channel*, so it belongs **inside the reviewer** (e.g. a `tokio::sync::Mutex` held by `DeferredAskUserReviewer` around its emit-event/await-answer critical section), not on each `Engine`. Reason: in multi-agent (Phase 3) a parent and its children **share one reviewer instance**; a per-Engine mutex would let parent + child escalations hit the same event/ops channel concurrently and race. Putting the lock in the shared reviewer serializes across all engines that share it. `DenyReviewer` needs no lock (no shared channel).
+- **Preserve the non-blocking-batch semantic (P4 — the deepest risk).** Today the `AskUser` arm *defers* the call (`deferred_calls` + resume) so the rest of a parallel batch keeps running; this refactor routes through `reviewer.review().await`, which is an inline await. The refactor MUST keep an `Allow`/`Deny` sibling in the same batch from being blocked by another sibling's pending `AskUser`. Two ways: (i) keep the defer/resume machinery underneath and have `DeferredAskUserReviewer::review()` drive it (preferred — least behavior change), or (ii) spawn each slot's resolution so awaits don't serialize the batch. Pick (i) unless it proves infeasible against the then-current engine; document whichever in the commit.
+- **Tests:** (a) policy `AskUser` + `AlwaysApprove` reviewer → tool runs; (b) `AskUser` + default `DenyReviewer` → blocked; (c) **non-blocking batch (P4):** a parallel batch with one `Allow` call and one `AskUser` call whose reviewer never answers (use a reviewer that awaits a token you never fire) → assert the `Allow` call still completes (is NOT blocked by the pending escalation), then cancel to unwind; (d) **shared-reviewer serialization (P3):** two engines sharing one `DeferredAskUserReviewer`, both escalate → a recording reviewer asserts its critical section is entered serially (no overlap). Reuse `tests/permission_parallel_batch.rs` patterns.
 - **Verify F7:** confirm the refactor preserves agemo's interactive behavior (Task 9) and that the new default (`DenyReviewer`) is the documented change.
 - **Commit:** `feat!(loop): resolve AskUser via Reviewer; serialize concurrent escalations`.
 
@@ -372,6 +371,6 @@ Grounding: `agemo/src/main.rs` already bridges the root engine's `AskUser` event
 
 ## Self-review notes (gaps flagged during planning)
 
-- **Spec drift:** spec §3 sketched `ReviewDecision { Approve, Deny }`; the plan uses `Deny { reason }` (richer, matches `Permission::Deny`). Reconcile the spec when implementing — Task 3/cross-cutting note this.
+- **Spec reconciled (P6):** spec §3 now uses `ReviewDecision::Deny { reason }` (richer, matches `Permission::Deny`), aligned with this plan. No remaining drift.
 - **Default choice:** Task 6 resolves the spec's slight ambiguity — default is `DenyReviewer` (fail-safe), and hosts opt into `DeferredAskUserReviewer`. Documented as a behavior change vs today's stall (spec F7).
 - **Moving target:** Phases 2–4 reference current `engine.rs` line numbers/handles; re-verify against the then-current code at pickup (loop is in active flux).
