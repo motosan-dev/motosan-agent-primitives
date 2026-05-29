@@ -183,8 +183,9 @@ This separation is natural: "should we ask?" is domain knowledge; "ask whom, and
 | Piece | Crate | Note |
 |---|---|---|
 | `Reviewer` trait, `ApprovalRequest`, `ReviewDecision` | **`motosan-agent-primitives`** | Contract types, same module/role as `PermissionPolicy`. Small, additive. |
-| `EngineBuilder::reviewer(..)`; refactor the existing `Permission::AskUser` handling (emit event → `deferred_calls` → `AgentOp::AskUserAnswer`) to sit **behind** a `Reviewer` | `motosan-agent-loop` | Not a new channel — the existing machinery in `engine.rs`'s `consult_policy` match becomes the default reviewer impl. |
-| `DenyReviewer` (default-when-none), `DeferredAskUserReviewer` (wraps today's event/defer/ops behavior), `GuardianReviewer`, composite | `motosan-agent-loop` (and host crates like agemo) | NOT in primitives. |
+| `EngineBuilder::reviewer(..)`; fold `review()` into the per-call future so `Permission::AskUser` resolves through the reviewer (§9a preferred; §9b fallback) | `motosan-agent-loop` | Engine stays minimal under §9a — no new slot/select/spawn/registry. |
+| `DenyReviewer` (default-when-none) | `motosan-agent-loop` | NOT in primitives. |
+| Interactive reviewer (owns stdin/UI I/O), `GuardianReviewer`, composite, `ChannelReviewer` | host crates (e.g. agemo) / user-land | Under §9a the human reviewer owns its I/O, so it lives with the host, not the engine. |
 | Child policy inheritance + shared-reviewer sugar | `motosan-agent-subagent` | `SubagentConfig::inherit_approval_from`. |
 
 Rationale for primitives placement: a `Reviewer` is referenced by loop, subagent, and potentially harness consumers — the same cross-cutting contract role `PermissionPolicy` already plays there. A dedicated `motosan-agent-approval` crate is premature for a single concept.
@@ -203,15 +204,61 @@ Rationale for primitives placement: a `Reviewer` is referenced by loop, subagent
 - Both are **opt-out** for a fully isolated child.
 - **Sandbox is explicitly out of scope** — Motosan has no per-engine sandbox in the approval path; revisit only if a vertical needs it.
 
-## 9. Relationship to the existing event/defer/ops channel (and remote)
+## 9. Engine integration: reviewer-owned I/O (preferred) vs engine-mediated (fallback)
 
-The "emit `AskUser` event → defer the call → resolve on `AgentOp::AskUserAnswer`" machinery described in §1 **already exists in the loop**. This spec does **not** build a new channel — it puts that machinery **behind the `Reviewer` trait** so it becomes swappable and child-reachable:
+There are two ways to wire `review()` into the loop. They produce the same trait and the same usage; they differ in how much machinery the engine grows.
 
-- The **default interactive reviewer** *is* today's behavior (emit the AskUser event, defer, await the answer op), refactored to live behind `Reviewer`. Root-engine behavior is preserved.
-- A **guardian** reviewer is a different impl of the same trait — no event/defer needed; it just awaits a sub-agent turn.
-- **Remote / IPC** (if Motosan grows an app-server driver) is *also* already this shape: the event goes over the wire instead of in-process, the answer op comes back over the wire. The `Reviewer` trait and all callers/policies are untouched — only the event transport changes.
+### 9a. Preferred — "A+B": reviewer owns its I/O, review is an `await` inside the per-call future
 
-This is why the seam is an async trait: it abstracts an answering mechanism the loop already implements in one (in-process) form today, and leaves room for the remote form later without a contract change.
+- **A — the reviewer owns its I/O.** `review(req)` is a fully self-contained async call. The interactive (human) reviewer is provided by the **host** (e.g. agemo) wired to the host's own input channel; it does **not** go through the engine's `AgentOp::AskUserAnswer` ops channel. The engine never forwards answers, holds no oneshot registry.
+- **B — review is an `await` inside each tool call's future.** The loop already runs tool calls as per-call async futures joined concurrently. Fold the review into that future:
+
+```rust
+async fn run_one_call(call) -> ToolOutput {
+    match policy.check(&call).await {
+        Allow            => execute(call).await,
+        Deny { reason }  => error(reason),
+        AskUser { prompt } => match reviewer.review(req_from(call, prompt)).await {
+            Approve         => execute(call).await,
+            Deny { reason } => error(reason),
+        }
+    }
+}
+// batch = join_all(calls.map(run_one_call))
+```
+
+**Why this is the cleaner end state:** `join` cooperatively multiplexes the per-call futures on one task. A `review()` that suspends (awaiting a human) returns `Pending`, so the executor advances the sibling calls — **non-blocking for free, no `tokio::spawn`**. This eliminates the engine-side machinery the engine-mediated route needs: no new deferred-slot variant, no `select!` over ops, no spawned `JoinHandle` + abort, no oneshot registry, no answer-op forwarding. Cancellation = dropping the joined future (and `review()` races `req.cancellation_token`). The `Reviewer` trait stays truly decoupled — even the default interactive reviewer owns its channel, so nothing engine-internal leaks into it.
+
+- **P4 (non-blocking)** is satisfied by `join`, not by spawning.
+- **P3 (serialization across a shared reviewer)** still lives inside the reviewer (an internal mutex around its critical section), unchanged.
+
+### 9b. Fallback — engine-mediated: keep the existing defer/resume, route review through it
+
+The loop today handles `Permission::AskUser` by emitting an `AskUser` event, deferring the call (`deferred_calls`), and resolving it via `AgentOp::AskUserAnswer` in `resolve_deferred_slots`. The fallback keeps that machinery and drives `review()` from it (spawn the review, add a `DeferredReview` slot, `select!` the result, forward answer ops to the reviewer's registry). This is a **smaller diff** against the current engine but **adds concurrency machinery** to `resolve_deferred_slots` (the complexity P3/P4/cancellation tests must pin down). Choose this only if §9a's per-call-future restructuring proves too invasive against the then-current engine.
+
+### 9c. Decision
+
+**Spike §9a first.** If folding review into the per-call future is feasible, take it — the engine barely grows and the trait is fully decoupled. If the intercept/resolve phases resist restructuring, fall back to §9b and lean on tests. Either way the `Reviewer` trait, `ApprovalRequest`, `ReviewDecision`, and all usage tiers are identical — this is purely an internal integration choice.
+
+### 9d. Remote / IPC is just another reviewer
+
+If Motosan later grows an app-server / remote driver, the structured request/response protocol (Codex's SQ/EQ) lives inside a **`ChannelReviewer`** impl: its `review()` emits an event over the wire and awaits a response the client resolves. The trait, engine, and policies are untouched — the wire protocol is one reviewer's concern, not an engine guarantee. Sharing one `ChannelReviewer` across all engines/children gives the uniform, can't-bypass protocol Codex enforces at the engine level — by convention here, which suits a multi-vertical framework.
+
+## 9e. Spectrum coverage: pi and Codex both map onto this architecture
+
+The whole point is one contract spanning pi-minimal → Codex-heavy. Verified mapping:
+
+| Capability | pi | Codex | How it lands on this design |
+|---|---|---|---|
+| block / allow a call | `beforeToolCall → {block}` | execpolicy / sandbox | `Hook::pre_tool_use` (Abort) or policy `Deny` — no reviewer needed |
+| ask a human | `await confirm()` in the hook | SQ/EQ event → `oneshot` → response op | policy `AskUser` + a reviewer whose `review()` awaits the host's channel (§9a) — **pi's `confirm()` is literally a `review()`** |
+| reviewer is an agent | — | guardian sub-agent | `GuardianReviewer::review()` runs a sub-agent turn |
+| central sink for many agents | — (no sub-agents) | one approval sink | children share one `Arc<dyn Reviewer>` (§8) |
+| structured remote protocol | — | engine-enforced SQ/EQ | a shared `ChannelReviewer` (§9d) — convention, more flexible |
+| "don't ask again this session" | — | `ApprovedForSession` | a stateful reviewer remembers internally |
+| three-axis security | — | execpolicy + sandbox + AskForApproval | orthogonal: policy (decision) + reviewer (who answers) + sandbox (separate) |
+
+**pi is the degenerate case** of this design (single agent, reviewer = `confirm()`). **Every Codex mechanism** maps to a reviewer impl plus the sharing convention, with the engine staying minimal. Nothing in either reference point is inexpressible here.
 
 ## 10. Testing strategy
 
@@ -224,7 +271,7 @@ This is why the seam is an async trait: it abstracts an answering mechanism the 
 ## 11. Versioning & migration impact
 
 - **primitives:** purely additive — one new trait plus two new types, with **no changes to any existing item** (unlike D-M10-2, which added a field to an existing struct and forced literal constructors to update). This is a non-breaking minor bump; every existing `Hook` / `PermissionPolicy` impl compiles untouched.
-- **loop:** new `EngineBuilder::reviewer()` setter (additive); **refactor** the existing `Permission::AskUser` handling in `engine.rs` (event → `deferred_calls` → `AgentOp::AskUserAnswer`) into a `DeferredAskUserReviewer` impl so it is swappable, behind the trait (root behavior preserved); add a per-session approval serialization point (F2). **F7 (resolved):** today an unbridged/unanswered `AskUser` *stalls* (deferred call never resolves until timeout/cancel). So `DenyReviewer` as the **default-when-no-reviewer-is-set** is a deliberate, safer behavior change for the no-reviewer case (e.g. a child that nobody wired) — call it out in the changelog. Hosts that wire `DeferredAskUserReviewer` (or agemo today) keep the current ask-the-human behavior.
+- **loop:** new `EngineBuilder::reviewer()` setter (additive); resolve `Permission::AskUser` through the reviewer per §9 (spike §9a — fold review into the per-call future, reviewer owns its I/O; fall back to §9b only if restructuring resists). Default-when-none is `DenyReviewer`. **F7 (resolved):** today an unbridged/unanswered `AskUser` *stalls* (deferred call never resolves until timeout/cancel). So `DenyReviewer` as the default is a deliberate, safer behavior change for the no-reviewer case (e.g. a child nobody wired) — call it out in the changelog. The interactive ask-the-human reviewer moves to the host (agemo, §9a), preserving its behavior.
 - **subagent:** `SubagentConfig::inherit_approval_from` sugar (additive).
 - **agemo:** migrate its existing stdin `AskUser` bridge into a `StdinReviewer` impl. This is behavior-preserving *for agemo specifically* (it already answers root-engine `AskUser`); it is independent of the F7 question about the framework-wide default when no reviewer is wired.
 
@@ -246,4 +293,4 @@ This is why the seam is an async trait: it abstracts an answering mechanism the 
 
 ## 14. Sequencing
 
-Do not implement before **M11** (rental harness → freeze 1.0). This is forward design. When a vertical genuinely needs interactive child-agent approval: (1) add the primitives types (additive); (2) refactor the loop's existing `Permission::AskUser` machinery (event → `deferred_calls` → `AgentOp::AskUserAnswer`) into a `DeferredAskUserReviewer` behind the trait, add the `reviewer()` setter and the `DenyReviewer` default, and the per-session serialization point; (3) add the subagent inheritance sugar so a child's `AskUser` routes to the parent session's reviewer/ops channel (the actual gap); (4) agemo keeps working through the `DeferredAskUserReviewer` (behavior-preserving for the root).
+Do not implement before **M11** (rental harness → freeze 1.0). This is forward design. When a vertical genuinely needs interactive child-agent approval: (1) add the primitives types (additive); (2) add the `reviewer()` setter + `DenyReviewer` default, and resolve `AskUser` through the reviewer per §9 (spike §9a first — fold review into the per-call future; §9b fallback); (3) add the subagent inheritance sugar so a child's `AskUser` routes to the parent session's reviewer/ops channel (the actual gap); (4) agemo keeps working through the `DeferredAskUserReviewer` (behavior-preserving for the root).
