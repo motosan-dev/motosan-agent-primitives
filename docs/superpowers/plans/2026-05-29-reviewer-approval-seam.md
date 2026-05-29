@@ -17,7 +17,7 @@
 This feature spans four crates with a strict dependency order. It is **one coherent feature**, not independent subsystems, so it is one plan with four phases. Each phase is independently committable and testable.
 
 - **Phase 1 — primitives:** ✅ **DONE (2026-05-29, primitives 0.4.0).** New `Reviewer` trait + `ApprovalRequest` + `ReviewDecision`. Purely additive (no existing item changes). Fully detailed below.
-- **Phase 2 — loop:** §9a scoping spike (feasibility + migration surface), `DenyReviewer`, `EngineBuilder::reviewer()`, resolve `AskUser` through the reviewer (§9a: review inside the per-call future → non-blocking via `join`), and rewrite the displaced event/op approval tests (R1). Interactive reviewer NOT here (host-owned, Phase 4).
+- **Phase 2 — loop:** §9a spike (size the refactor + migration surface), `DenyReviewer`, `EngineBuilder::reviewer()`, resolve `AskUser` through the reviewer (§9a: review inside the per-call future → non-blocking via `join`), and rewrite the displaced event/op approval tests (R1). Interactive reviewer NOT here (host-owned, Phase 4).
 - **Phase 3 — subagent:** `SubagentConfig::inherit_approval_from` sugar so a child's `AskUser` routes to the parent session's reviewer/ops channel (the actual gap).
 - **Phase 4 — agemo:** agemo provides its own host-owned `Reviewer` (owns stdin I/O) and wires it via `.reviewer(..)`, restoring interactive approval after the loop default became `DenyReviewer`.
 
@@ -296,18 +296,18 @@ git commit -m "feat: add Reviewer trait (approval-resolution seam)"
 
 ## Phase 2 — loop: reviewer wiring (§9a / A+B, decided)
 
-> **Architecture (decided):** **§9a (A+B)** per spec §9 — the reviewer owns its I/O and `review()` is an `await` inside each tool call's per-call future, so `join` gives non-blocking for free and the engine grows almost nothing. The engine-mediated defer/resume alternative is **rejected** (spec §9c); revisit only if the §9d scoping spike (Task 5) finds §9a structurally impossible. §9a **replaces** the loop's current `ExtensionEvent::AskUser`/`AgentOp::AskUserAnswer` approval path, so existing permission-approval tests are rewritten and agemo's bridge moves into a host-owned reviewer (R1). The interactive (human) reviewer lives with the host (agemo, Phase 4), not the loop — the loop only ships `DenyReviewer`. Approval **timeout** becomes the reviewer's job (R2). Verify event ordering unchanged (R4).
+> **Architecture (decided):** **§9a (A+B)** per spec §9 — the reviewer owns its I/O and `review()` is an `await` inside each tool call's per-call future, so `join` gives non-blocking for free and the engine grows almost nothing. The engine-mediated defer/resume alternative is **rejected** (spec §9c). §9a **replaces** the loop's current `ExtensionEvent::AskUser`/`AgentOp::AskUserAnswer` approval path, so existing permission-approval tests are rewritten and agemo's bridge moves into a host-owned reviewer (R1). The interactive (human) reviewer lives with the host (agemo, Phase 4), not the loop — the loop only ships `DenyReviewer`. Approval **timeout** becomes the reviewer's job (R2). Verify event ordering unchanged (R4).
 
 Grounding (RE-VERIFY at pickup — loop is in active flux; line numbers may have drifted):
 - `src/core/engine.rs`: the `consult_policy(...)` match — `Allow` (emit ToolStarted + dispatch), `Deny { reason }` (resolved error slot), `AskUser { prompt }` (today: emit `ExtensionEvent::AskUser` + `deferred_calls` + resolve via `AgentOp::AskUserAnswer`). Find how per-call futures are composed and joined (`execute_tools_parallel` / `resolve_deferred_slots` / `join!`).
 - `EngineBuilder` setters (`permission_policy`, `session_id`, …) and `Engine`/`build()`.
 - `src/core/permission_runtime.rs`: `consult_policy(...) -> Permission`; `default_prompt(name, args)`.
 
-### Task 5: SPIKE — scope §9a (feasibility + migration surface; timeboxed, ~half day)
+### Task 5: SPIKE — size the §9a refactor + migration (timeboxed, ~half day)
 
-§9a is the decided architecture; this spike **scopes** it, it does not choose between architectures.
+§9a is the decided architecture; this spike **sizes the work**, it does not re-choose.
 
-- **Feasibility:** read how a tool call flows from `consult_policy` → slot → execution today, and confirm the permission decision can move INTO the per-call async chain (`policy.check → if AskUser { reviewer.review } → execute`) joined like the other per-call futures, rather than the separate intercept→`resolve_deferred_slots` phase. (If it proves *structurally impossible*, escalate — the rejected §9b in spec §9c is the only bridge; do not silently switch.)
+- **Refactor sizing:** read how a tool call flows from `consult_policy` → slot → execution today, and gauge how invasive it is to move the permission decision INTO the per-call async chain (`policy.check → if AskUser { reviewer.review } → execute`) joined like the other per-call futures, rather than the separate intercept→`resolve_deferred_slots` phase.
 - **Migration surface (R1):** enumerate the existing permission-approval tests that assert the `ExtensionEvent::AskUser` → `AgentOp::AskUserAnswer` round-trip (they will be rewritten), and the agemo code that drives it (moves into a host-owned reviewer in Phase 4). List them so Task 7 / Phase 4 budget the rewrite.
 - **Event ordering (R4):** note where ToolStarted etc. fire today so Task 7 preserves the order.
 - Output: a short scoping note recorded in the commit / a scratch doc. No production code need land here.
@@ -329,7 +329,7 @@ Grounding (RE-VERIFY at pickup — loop is in active flux; line numbers may have
 
 - Add `approval_request_from(...)` building an OWNED `ApprovalRequest` (clone `tool_call`, `annotations`, `session_id`, the already-computed `recent_messages_owned`, `prompt`, plus the engine's `cancellation_token`).
 - **§9a (the design):** fold the decision into the per-call future — `match policy.check { Allow => execute, Deny => error, AskUser { prompt } => match reviewer.review(approval_request_from(..)).await { Approve => execute, Deny { reason } => error } }`. The batch's existing `join` runs these concurrently, so a suspended `review()` (awaiting a human) does NOT block sibling `Allow` calls — **non-blocking for free, no `tokio::spawn`** (P4 satisfied structurally).
-- **Migration (R1):** this removes the `ExtensionEvent::AskUser` → `deferred_calls` → `AgentOp::AskUserAnswer` path for *permission* approval (leave the `ask_user` *extension*'s use of it intact, F6). Rewrite the permission-approval tests the Task 5 spike enumerated to drive a test `Reviewer` instead of feeding answer ops. (Only if the spike found §9a structurally impossible would the rejected §9c defer/resume route apply — escalate first, don't switch silently.)
+- **Migration (R1):** this removes the `ExtensionEvent::AskUser` → `deferred_calls` → `AgentOp::AskUserAnswer` path for *permission* approval (leave the `ask_user` *extension*'s use of it intact, F6). Rewrite the permission-approval tests the Task 5 spike enumerated to drive a test `Reviewer` instead of feeding answer ops.
 - **P3 (serialization) — same either way:** the per-session mutex lives **inside the shared reviewer** (around its critical section), NOT the Engine — because parent + children share one reviewer instance (Phase 3) and a per-Engine lock wouldn't serialize across them. `DenyReviewer` needs none.
 - **Map decisions:** `Approve` → the existing `Allow` path (emit ToolStarted + dispatch); `ReviewDecision::Deny { reason }` → the existing `Permission::Deny` resolved-error slot.
 - **Tests:** (a) `AskUser` + `AlwaysApprove` → tool runs; (b) `AskUser` + default `DenyReviewer` → blocked; (c) **P4 non-blocking:** a batch with one `Allow` and one `AskUser` whose reviewer awaits a token you never fire → assert the `Allow` completes, then cancel to unwind; (d) **P3 serialization:** two engines sharing one reviewer, both escalate → recording reviewer asserts its critical section is entered serially; (e) **pi-parity:** a recording reviewer asserts `review()` is never called when the policy returns only `Allow`/`Deny`. Reuse `tests/permission_parallel_batch.rs` patterns.

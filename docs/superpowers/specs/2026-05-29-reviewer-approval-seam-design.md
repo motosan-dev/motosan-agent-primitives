@@ -244,11 +244,11 @@ async fn run_one_call(call) -> ToolOutput {
 
 ### 9c. Rejected alternative — engine-mediated (defer/resume)
 
-Keeping today's defer/resume and driving `review()` from it (spawn + a `DeferredReview` slot + `select!` + forwarding answer ops to the reviewer) was considered. It is a *smaller diff* and *preserves* the event/op protocol — but it permanently grows concurrency machinery in `resolve_deferred_slots` and leaves the default reviewer engine-coupled. **Rejected** in favour of §9a's cleaner end state. Kept on record only as the bridge to revisit if the §9d scoping spike finds §9a structurally impossible.
+Keeping today's defer/resume and driving `review()` from it (spawn + a `DeferredReview` slot + `select!` + forwarding answer ops to the reviewer) was considered. It is a *smaller diff* and *preserves* the event/op protocol — but it permanently grows concurrency machinery in `resolve_deferred_slots` and leaves the default reviewer engine-coupled. **Rejected** in favour of §9a's cleaner end state. Recorded here so the choice is not re-litigated.
 
-### 9d. First step — scoping spike (not a decision)
+### 9d. First step — size the refactor
 
-Before writing production code, confirm against the **current** engine that the permission decision can move INTO the per-call async chain (`policy.check → if AskUser { reviewer.review } → execute`) joined like the other per-call futures, and enumerate the exact existing tests + agemo code to migrate off the event/op protocol. This is a scope/feasibility check for §9a — not a choice between architectures.
+Before writing production code, read how a tool call flows from `consult_policy` → slot → execution today and **estimate how invasive** folding the permission decision into the per-call async chain (`policy.check → if AskUser { reviewer.review } → execute`) is, and enumerate the existing tests + agemo code that migrate off the event/op protocol (R1). This sizes the work — §9a is the design either way.
 
 ### 9e. Remote / IPC is just another reviewer
 
