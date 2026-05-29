@@ -41,6 +41,7 @@
 //! `0.x` — API surface is iterating. Once two harnesses (finance + rental)
 //! have been built against this crate the API will be frozen as `1.0`.
 
+pub mod approval;
 pub mod event;
 pub mod hook;
 pub mod memory;
@@ -48,6 +49,7 @@ pub mod message;
 pub mod permission;
 pub mod tool;
 
+pub use approval::ReviewDecision;
 pub use event::*;
 pub use hook::*;
 pub use memory::*;
