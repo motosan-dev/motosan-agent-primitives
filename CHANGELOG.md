@@ -1,3 +1,9 @@
+## 0.4.0 — 2026-05-29
+
+ADDED:
+- `Reviewer` trait, `ApprovalRequest`, `ReviewDecision` (approval-resolution
+  seam under `Permission::AskUser`). Additive — no existing item changed.
+
 ## 0.3.0 — 2026-05-29
 
 ADDED:

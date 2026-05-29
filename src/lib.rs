@@ -49,7 +49,7 @@ pub mod message;
 pub mod permission;
 pub mod tool;
 
-pub use approval::ReviewDecision;
+pub use approval::{ApprovalRequest, ReviewDecision, Reviewer};
 pub use event::*;
 pub use hook::*;
 pub use memory::*;

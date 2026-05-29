@@ -5,6 +5,7 @@
 //! framework consults the session's single `Reviewer` to *resolve* it into a
 //! final `ReviewDecision`. See the design spec for the full rationale.
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
@@ -46,6 +47,19 @@ pub struct ApprovalRequest {
     pub cancellation_token: CancellationToken,
 }
 
+/// Resolves an escalated tool call into a final [`ReviewDecision`].
+///
+/// Exactly one per session; consulted **only** when the composed
+/// [`PermissionPolicy`](crate::permission::PermissionPolicy) decision is
+/// [`Permission::AskUser`](crate::permission::Permission::AskUser). Takes the
+/// request **by value** so the reviewer may move/queue/defer it. Object-safe:
+/// usable as `Arc<dyn Reviewer>`.
+#[async_trait]
+pub trait Reviewer: Send + Sync {
+    /// Resolve `req`. Long waits MUST race `req.cancellation_token`.
+    async fn review(&self, req: ApprovalRequest) -> ReviewDecision;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -54,7 +68,9 @@ mod tests {
     fn review_decision_round_trips() {
         for d in [
             ReviewDecision::Approve,
-            ReviewDecision::Deny { reason: "no".into() },
+            ReviewDecision::Deny {
+                reason: "no".into(),
+            },
         ] {
             let s = serde_json::to_string(&d).unwrap();
             let back: ReviewDecision = serde_json::from_str(&s).unwrap();
@@ -70,14 +86,17 @@ mod request_tests {
     use crate::tool::{ToolAnnotations, ToolCall};
     use tokio_util::sync::CancellationToken;
 
-    fn sample_request() -> ApprovalRequest {
+    pub(crate) fn sample_request() -> ApprovalRequest {
         ApprovalRequest {
             tool_call: ToolCall {
                 id: "call-1".into(),
                 name: "place_order".into(),
                 input: serde_json::json!({ "symbol": "AAPL", "qty": 10 }),
             },
-            annotations: ToolAnnotations { destructive: true, ..Default::default() },
+            annotations: ToolAnnotations {
+                destructive: true,
+                ..Default::default()
+            },
             session_id: "sess-1".into(),
             recent_messages: vec![Message::text(Role::User, "buy 10 AAPL")],
             prompt: Some("Approve buying 10 AAPL?".into()),
@@ -94,5 +113,31 @@ mod request_tests {
         assert_eq!(req.prompt.as_deref(), Some("Approve buying 10 AAPL?"));
         fn _assert_send_static<T: Send + 'static>() {}
         _assert_send_static::<ApprovalRequest>();
+    }
+}
+
+#[cfg(test)]
+mod reviewer_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    struct AlwaysApprove;
+    #[async_trait]
+    impl Reviewer for AlwaysApprove {
+        async fn review(&self, _req: ApprovalRequest) -> ReviewDecision {
+            ReviewDecision::Approve
+        }
+    }
+
+    /// Object-safety smoke test: must compile.
+    #[allow(dead_code)]
+    fn assert_object_safe(_r: Arc<dyn Reviewer>) {}
+
+    #[tokio::test]
+    async fn reviewer_resolves_by_value() {
+        let r: Arc<dyn Reviewer> = Arc::new(AlwaysApprove);
+        let req = super::request_tests::sample_request();
+        assert_eq!(r.review(req).await, ReviewDecision::Approve);
     }
 }
