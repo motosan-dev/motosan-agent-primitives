@@ -2,8 +2,33 @@
 //!
 //! [`PermissionPolicy`](crate::permission::PermissionPolicy) *decides*
 //! (`Allow | Deny | AskUser`). When the composed decision is `AskUser`, the
-//! framework consults the session's single `Reviewer` to *resolve* it into a
-//! final `ReviewDecision`. See the design spec for the full rationale.
+//! framework consults the session's single [`Reviewer`] to *resolve* it into a
+//! final [`ReviewDecision`]. See the design spec for the full rationale.
+//!
+//! # Examples
+//!
+//! Implement a reviewer that approves ordinary escalations, denies destructive
+//! ones with a reason, and fail-closes when cancellation is already observed:
+//!
+//! ```
+//! use async_trait::async_trait;
+//! use motosan_agent_primitives::{ApprovalRequest, ReviewDecision, Reviewer};
+//!
+//! struct SafetyReviewer;
+//!
+//! #[async_trait]
+//! impl Reviewer for SafetyReviewer {
+//!     async fn review(&self, req: ApprovalRequest) -> ReviewDecision {
+//!         if req.cancellation_token.is_cancelled() {
+//!             ReviewDecision::Deny { reason: "turn cancelled".into() }
+//!         } else if req.annotations.destructive {
+//!             ReviewDecision::Deny { reason: "destructive tool needs a human".into() }
+//!         } else {
+//!             ReviewDecision::Approve
+//!         }
+//!     }
+//! }
+//! ```
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
