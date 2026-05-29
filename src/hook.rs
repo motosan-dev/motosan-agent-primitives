@@ -242,6 +242,14 @@ pub struct PostToolUseFailureCtx {
     pub tool_call: ToolCall,
     /// Why the call failed.
     pub failure: ToolFailure,
+    /// The final [`ToolResult`] the model will see for this failed call.
+    ///
+    /// Carries the same wire shape the model receives, with
+    /// [`ToolResult::is_error`] set to `true` and `content` describing the
+    /// failure. Audit hooks can record this directly instead of
+    /// reconstructing a result from [`failure`](Self::failure). Added in
+    /// 0.2.0 (M10 D-M10-2) — see CHANGELOG.
+    pub result: ToolResult,
     /// Cancellation token; hooks should observe this.
     pub cancellation_token: CancellationToken,
 }
@@ -489,6 +497,7 @@ mod tests {
             session_id: "s".into(),
             tool_call: tool_call(),
             failure: ToolFailure::Cancelled,
+            result: ToolResult::error("c1", "cancelled"),
             cancellation_token: token.clone(),
         };
         h.post_tool_use(&ok).await;
@@ -575,5 +584,26 @@ mod tests {
             .await,
             HookResult::cont()
         );
+    }
+
+    /// M10 D-M10-2: PostToolUseFailureCtx now carries the final ToolResult
+    /// the model sees alongside the failure enum. Audit hooks can read it
+    /// directly instead of synthesizing one from `failure`.
+    #[test]
+    fn post_tool_use_failure_ctx_exposes_result() {
+        let token = CancellationToken::new();
+        let res = ToolResult::error("c1", "boom");
+        let ctx = PostToolUseFailureCtx {
+            session_id: "s".into(),
+            tool_call: tool_call(),
+            failure: ToolFailure::Error {
+                message: "boom".into(),
+            },
+            result: res.clone(),
+            cancellation_token: token,
+        };
+        assert_eq!(ctx.result, res);
+        assert!(ctx.result.is_error);
+        assert_eq!(ctx.result.tool_use_id, "c1");
     }
 }

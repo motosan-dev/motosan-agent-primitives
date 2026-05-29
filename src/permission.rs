@@ -32,6 +32,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+use crate::message::Message;
 use crate::tool::ToolAnnotations;
 
 /// Outcome of one permission check.
@@ -124,6 +125,17 @@ pub struct PermissionContext<'a> {
     pub annotations: &'a ToolAnnotations,
     /// Current session trust mode.
     pub mode: PermissionMode,
+    /// Recent conversation history the policy may inspect when rendering an
+    /// approval prompt or deciding whether the call is contextually
+    /// reasonable.
+    ///
+    /// Borrowed to keep the struct zero-alloc; the slice points into the
+    /// agent loop's transcript and is valid for the duration of the
+    /// [`check`](PermissionPolicy::check) call. The framework chooses the
+    /// window size (default 10 most recent messages); policies must treat
+    /// an empty slice as a normal case (e.g. cold start, no history yet).
+    /// Added in 0.2.0 (M10 D-M10-3) — see CHANGELOG.
+    pub recent_messages: &'a [Message],
 }
 
 /// A pluggable rule object that decides whether a tool call may run.
@@ -213,6 +225,7 @@ mod tests {
             tool_input: input,
             annotations,
             mode,
+            recent_messages: &[],
         }
     }
 
@@ -261,6 +274,61 @@ mod tests {
             let s = serde_json::to_string(&m).unwrap();
             let back: PermissionMode = serde_json::from_str(&s).unwrap();
             assert_eq!(m, back);
+        }
+    }
+
+    /// M10 D-M10-3: PermissionContext now carries a borrowed slice of
+    /// recent messages so a policy can render a context-aware approval
+    /// prompt without forcing tools to redundantly include conversation
+    /// state in their args.
+    #[tokio::test]
+    async fn permission_context_exposes_recent_messages() {
+        use crate::message::Role;
+
+        struct InspectsHistory;
+        #[async_trait]
+        impl PermissionPolicy for InspectsHistory {
+            async fn check(&self, ctx: &PermissionContext<'_>) -> Permission {
+                if ctx.recent_messages.is_empty() {
+                    Permission::AskUser { prompt: None }
+                } else {
+                    Permission::Allow
+                }
+            }
+        }
+
+        let ann = ToolAnnotations::default();
+        let inp = json!({});
+        let history = vec![
+            Message::text(Role::User, "buy 10 AAPL"),
+            Message::text(Role::Assistant, "confirming order"),
+        ];
+        let c = PermissionContext {
+            session_id: "s",
+            tool_use_id: "t",
+            tool_name: "place_order",
+            tool_input: &inp,
+            annotations: &ann,
+            mode: PermissionMode::AcceptEdits,
+            recent_messages: &history,
+        };
+        assert_eq!(c.recent_messages.len(), 2);
+        let p: Arc<dyn PermissionPolicy> = Arc::new(InspectsHistory);
+        assert_eq!(p.check(&c).await, Permission::Allow);
+
+        // Empty slice is a valid input (cold start case).
+        let empty = PermissionContext {
+            session_id: "s",
+            tool_use_id: "t",
+            tool_name: "place_order",
+            tool_input: &inp,
+            annotations: &ann,
+            mode: PermissionMode::AcceptEdits,
+            recent_messages: &[],
+        };
+        match p.check(&empty).await {
+            Permission::AskUser { .. } => {}
+            other => panic!("expected AskUser on empty history, got {other:?}"),
         }
     }
 }
