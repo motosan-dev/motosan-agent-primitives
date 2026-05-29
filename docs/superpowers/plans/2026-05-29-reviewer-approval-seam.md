@@ -294,7 +294,7 @@ git commit -m "feat: add Reviewer trait (approval-resolution seam)"
 
 ---
 
-## Phase 2 — loop: reviewer wiring (A+B preferred)
+## Phase 2 — loop: reviewer wiring (§9a / A+B, decided)
 
 > **Architecture (decided):** **§9a (A+B)** per spec §9 — the reviewer owns its I/O and `review()` is an `await` inside each tool call's per-call future, so `join` gives non-blocking for free and the engine grows almost nothing. The engine-mediated defer/resume alternative is **rejected** (spec §9c); revisit only if the §9d scoping spike (Task 5) finds §9a structurally impossible. §9a **replaces** the loop's current `ExtensionEvent::AskUser`/`AgentOp::AskUserAnswer` approval path, so existing permission-approval tests are rewritten and agemo's bridge moves into a host-owned reviewer (R1). The interactive (human) reviewer lives with the host (agemo, Phase 4), not the loop — the loop only ships `DenyReviewer`. Approval **timeout** becomes the reviewer's job (R2). Verify event ordering unchanged (R4).
 
