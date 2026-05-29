@@ -239,7 +239,7 @@ async fn run_one_call(call) -> ToolOutput {
 - **Replaces the existing approval protocol (R1).** The loop's current `ExtensionEvent::AskUser` → `deferred_calls` → `AgentOp::AskUserAnswer` round-trip is **no longer used for permission approval** — the reviewer handles its own I/O. So existing permission-approval tests that assert that event/op round-trip must be **rewritten** (not merely retuned), and agemo's wire-based approval bridge moves into a host-owned reviewer. This migration is accepted, not avoided.
 - **Keep the `ask_user` extension separate (F6).** The `ask_user` *extension* (an agent asking the user a mid-turn question) still uses the event/op machinery; only the *permission* path stops using it. Do not entangle them.
 - **Timeout becomes the reviewer's job (R2).** agemo's `permission_timeout_secs` moves into its reviewer, which races a timeout against the answer (and honours `req.cancellation_token`).
-- **"Non-blocking for free" is realized once the fold lands (R3).** It holds only after check→review→execute actually compose into one joined per-call future; the first step (§9d) confirms that against the current engine.
+- **"Non-blocking for free" is realized once the fold lands (R3).** It holds only after check→review→execute actually compose into one joined per-call future; the first step (§9d) sizes that against the current engine.
 - **Verify event ordering (R4).** ToolStarted and friends must fire in the same order as today (Approve → the existing Allow path).
 
 ### 9c. Rejected alternative — engine-mediated (defer/resume)
@@ -264,7 +264,7 @@ The whole point is one contract spanning pi-minimal → Codex-heavy. Verified ma
 | ask a human | `await confirm()` in the hook | SQ/EQ event → `oneshot` → response op | policy `AskUser` + a reviewer whose `review()` awaits the host's channel (§9a) — **pi's `confirm()` is literally a `review()`** |
 | reviewer is an agent | — | guardian sub-agent | `GuardianReviewer::review()` runs a sub-agent turn |
 | central sink for many agents | — (no sub-agents) | one approval sink | children share one `Arc<dyn Reviewer>` (§8) |
-| structured remote protocol | — | engine-enforced SQ/EQ | a shared `ChannelReviewer` (§9d) — convention, more flexible |
+| structured remote protocol | — | engine-enforced SQ/EQ | a shared `ChannelReviewer` (§9e) — convention, more flexible |
 | "don't ask again this session" | — | `ApprovedForSession` | a stateful reviewer remembers internally |
 | three-axis security | — | execpolicy + sandbox + AskForApproval | orthogonal: policy (decision) + reviewer (who answers) + sandbox (separate) |
 
@@ -281,7 +281,7 @@ The whole point is one contract spanning pi-minimal → Codex-heavy. Verified ma
 ## 11. Versioning & migration impact
 
 - **primitives:** purely additive — one new trait plus two new types, with **no changes to any existing item** (unlike D-M10-2, which added a field to an existing struct and forced literal constructors to update). This is a non-breaking minor bump; every existing `Hook` / `PermissionPolicy` impl compiles untouched.
-- **loop:** new `EngineBuilder::reviewer()` setter (additive); resolve `Permission::AskUser` through the reviewer per §9a (fold review into the per-call future; reviewer owns its I/O). This **replaces** the current event/op approval path, so its existing approval tests get **rewritten** (R1) — the §9d scoping spike enumerates them first. Default-when-none is `DenyReviewer`. **F7 (resolved):** today an unbridged/unanswered `AskUser` *stalls* (deferred call never resolves until timeout/cancel); `DenyReviewer` as the default is a deliberate, safer change for the no-reviewer case — call it out in the changelog. The interactive ask-the-human reviewer moves to the host (agemo), preserving its behaviour.
+- **loop:** new `EngineBuilder::reviewer()` setter (additive); resolve `Permission::AskUser` through the reviewer per §9a (fold review into the per-call future; reviewer owns its I/O). This **replaces** the current event/op approval path, so its existing approval tests get **rewritten** (R1) — the §9d spike (size the refactor) enumerates them first. Default-when-none is `DenyReviewer`. **F7 (resolved):** today an unbridged/unanswered `AskUser` *stalls* (deferred call never resolves until timeout/cancel); `DenyReviewer` as the default is a deliberate, safer change for the no-reviewer case — call it out in the changelog. The interactive ask-the-human reviewer moves to the host (agemo), preserving its behaviour.
 - **subagent:** `SubagentConfig::inherit_approval_from` sugar (additive).
 - **agemo:** migrate its existing stdin `AskUser` bridge into a `StdinReviewer` impl. This is behavior-preserving *for agemo specifically* (it already answers root-engine `AskUser`); it is independent of the F7 question about the framework-wide default when no reviewer is wired.
 
@@ -303,4 +303,4 @@ The whole point is one contract spanning pi-minimal → Codex-heavy. Verified ma
 
 ## 14. Sequencing
 
-Do not implement before **M11** (rental harness → freeze 1.0). This is forward design. When a vertical genuinely needs interactive child-agent approval: (1) add the primitives types (additive); (2) add the `reviewer()` setter + `DenyReviewer` default, and resolve `AskUser` through the reviewer per §9a (fold review into the per-call future) — start with the §9d scoping spike, then rewrite the displaced event/op approval tests (R1); (3) add the subagent inheritance sugar so a child's `AskUser` routes to the parent session's reviewer/ops channel (the actual gap); (4) agemo provides its own host-owned `Reviewer` (owns stdin I/O, §9a) and wires it via `.reviewer(..)` — behavior-preserving for the root.
+Do not implement before **M11** (rental harness → freeze 1.0). This is forward design. When a vertical genuinely needs interactive child-agent approval: (1) add the primitives types (additive); (2) add the `reviewer()` setter + `DenyReviewer` default, and resolve `AskUser` through the reviewer per §9a (fold review into the per-call future) — start with the §9d spike (size the refactor), then rewrite the displaced event/op approval tests (R1); (3) add the subagent inheritance sugar so a child's `AskUser` routes to the parent session's reviewer/ops channel (the actual gap); (4) agemo provides its own host-owned `Reviewer` (owns stdin I/O, §9a) and wires it via `.reviewer(..)` — behavior-preserving for the root.
