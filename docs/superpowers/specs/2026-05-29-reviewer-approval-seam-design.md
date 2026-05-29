@@ -227,7 +227,9 @@ async fn run_one_call(call) -> ToolOutput {
 // batch = join_all(calls.map(run_one_call))
 ```
 
-**Why this is the cleaner end state:** `join` cooperatively multiplexes the per-call futures on one task. A `review()` that suspends (awaiting a human) returns `Pending`, so the executor advances the sibling calls — **non-blocking for free, no `tokio::spawn`**. This eliminates the engine-side machinery the engine-mediated route needs: no new deferred-slot variant, no `select!` over ops, no spawned `JoinHandle` + abort, no oneshot registry, no answer-op forwarding. Cancellation = dropping the joined future (and `review()` races `req.cancellation_token`). The `Reviewer` trait stays truly decoupled — even the default interactive reviewer owns its channel, so nothing engine-internal leaks into it.
+**Why this is the chosen end state:** once tool calls run as per-call futures of the form above, `join` cooperatively multiplexes them on one task — a `review()` that suspends (awaiting a human) returns `Pending`, so the executor advances the sibling calls. The result has no permission-specific deferred-slot variant, no `select!` over ops, no oneshot registry, no answer-op forwarding; the `Reviewer` trait stays truly decoupled (even a host's interactive reviewer owns its own channel, nothing engine-internal leaks in). Cancellation = dropping the joined future (and `review()` races `req.cancellation_token`).
+
+> **⚠️ Cost — this is a LARGE refactor, not a cheap one (spike 2026-05-30, §9d).** The engine today does **not** run per-call futures with the permission decision inside them — it is a two-phase pipeline (a slot pre-pass, then `join!(resolve_deferred_slots, execute_tools_parallel)`). Reaching the shape above means **rebuilding that pipeline** across ~8 dispatch call sites plus the streaming-eager path (which uses `tokio::spawn`). And the non-blocking property is **not new** — the existing resolver/executor `join!` already provides it; §9a re-achieves the same outcome through per-call futures **in order to fully decouple the reviewer**. We accept the LARGE cost deliberately for that cleaner end state; we are not getting non-blocking "for free" (the engine already had it). The cheaper engine-mediated route that reuses today's defer/resume is recorded as the rejected alternative in §9c.
 
 - **P4 (non-blocking)** is satisfied by `join`, not by spawning.
 - **P3 (serialization across a shared reviewer)** still lives inside the reviewer (an internal mutex around its critical section), unchanged.
@@ -239,16 +241,32 @@ async fn run_one_call(call) -> ToolOutput {
 - **Replaces the existing approval protocol (R1).** The loop's current `ExtensionEvent::AskUser` → `deferred_calls` → `AgentOp::AskUserAnswer` round-trip is **no longer used for permission approval** — the reviewer handles its own I/O. So existing permission-approval tests that assert that event/op round-trip must be **rewritten** (not merely retuned), and agemo's wire-based approval bridge moves into a host-owned reviewer. This migration is accepted, not avoided.
 - **Keep the `ask_user` extension separate (F6).** The `ask_user` *extension* (an agent asking the user a mid-turn question) still uses the event/op machinery; only the *permission* path stops using it. Do not entangle them.
 - **Timeout becomes the reviewer's job (R2).** agemo's `permission_timeout_secs` moves into its reviewer, which races a timeout against the answer (and honours `req.cancellation_token`).
-- **"Non-blocking for free" is realized once the fold lands (R3).** It holds only after check→review→execute actually compose into one joined per-call future; the first step (§9d) sizes that against the current engine.
+- **Non-blocking is preserved, not newly gained (R3).** The engine already keeps allowed siblings running while an approval waits (via `join!(resolve_deferred_slots, execute_tools_parallel)`). §9a re-achieves the same property through per-call futures as a by-product of decoupling the reviewer — it is not a free new benefit. Holds once check→review→execute compose into one joined per-call future (the LARGE refactor in §9d).
 - **Verify event ordering (R4).** ToolStarted and friends must fire in the same order as today (Approve → the existing Allow path).
 
 ### 9c. Rejected alternative — engine-mediated (defer/resume)
 
 Keeping today's defer/resume and driving `review()` from it (spawn + a `DeferredReview` slot + `select!` + forwarding answer ops to the reviewer) was considered. It is a *smaller diff* and *preserves* the event/op protocol — but it permanently grows concurrency machinery in `resolve_deferred_slots` and leaves the default reviewer engine-coupled. **Rejected** in favour of §9a's cleaner end state. Recorded here so the choice is not re-litigated.
 
-### 9d. First step — size the refactor
+### 9d. Sizing spike — RESULT: LARGE (run 2026-05-30, loop@main)
 
-Before writing production code, read how a tool call flows from `consult_policy` → slot → execution today and **estimate how invasive** folding the permission decision into the per-call async chain (`policy.check → if AskUser { reviewer.review } → execute`) is, and enumerate the existing tests + agemo code that migrate off the event/op protocol (R1). This sizes the work — §9a is the design either way.
+A read-only spike on `motosan-agent-loop` sized the §9a refactor. **Verdict: LARGE** (not structurally impossible — a real execution-pipeline rebuild). Recorded so the cost is not under-estimated again.
+
+**Why LARGE — today's flow is two-phase, not per-call:** permission is a slot *pre-pass* (`dispatch_tool_call_to_slot` → `consult_policy` → `InterceptedSlot`), and non-blocking comes from `join!(resolve_deferred_slots, execute_tools_parallel)` — *not* from review-inside-a-per-call-future. `AskUser` today emits `ExtensionEvent::AskUser`, inserts into `deferred_calls`, returns `InterceptedSlot::DeferredPermission`, and is resolved later from the shared `ops_rx` via `AgentOp::AskUserAnswer`.
+
+**Restructure surface (the per-call fold touches all of these):**
+- Engine/builder: add `reviewer` field + `DenyReviewer` default (`EngineBuilder` ~`engine.rs:424`, `Engine` ~`:857`).
+- Permission path: `permission_runtime::consult_policy` (`:19`) + a new owned-`ApprovalRequest` builder.
+- Execution pipeline (the bulk): `dispatch_tool_call_to_slot`, `execute_tools_with_policy`, `resolve_and_execute_intercepted_slots`, `execute_tools_parallel`, the streaming-eager path `resolve_and_combine_preexecuted_slots`, and ~8 `dispatch_tool_call_to_slot` call sites.
+- Remove the *permission-specific* defer/op machinery (`InterceptedSlot::DeferredPermission`, the `deferred_calls` insert, the permission branch of the `AgentOp::AskUserAnswer` handler, `permission_runtime::approval_from_answer`).
+
+**Hard constraints surfaced (do not break these):**
+- The `ask_user` **extension** (agent asks a mid-turn question) **reuses the same `ExtensionEvent::AskUser` event type** and the `AgentOp::AskUserAnswer` op. §9a removes that path for *permission* only — `AgentOp::AskUserAnswer` and the event **must stay** for the ask_user extension + planning/defer protocols (F6). Migrating permission must not entangle them.
+- The **streaming-eager executor** uses `tokio::spawn` (`src/streaming_executor.rs`), so the "one task, pure `join`" non-blocking story holds for the ordinary batch but **not** the streaming path — §9a must handle that path explicitly.
+
+**Migration list (rewrite to drive a test `Reviewer`, not feed answer ops):** `tests/permission_gating.rs` (ask_user approve/deny/timeout, ToolStarted ordering), `tests/permission_parallel_batch.rs` (sibling non-block), `tests/streaming_permission.rs`, `tests/permission_wildcard_isolation.rs` (split the permission side from the extension side). agemo's permission bridge (`agemo/src/main.rs` stdin↔`AgentOp::AskUserAnswer`, `permission_timeout_secs`) moves into a host-owned reviewer (Phase 4).
+
+**Decision (made with this result in hand):** proceed with §9a anyway — the cleaner, fully-decoupled end state is worth the LARGE refactor. The spike's surfaces above become Phase 2's task breakdown.
 
 ### 9e. Remote / IPC is just another reviewer
 
