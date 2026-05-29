@@ -1,3 +1,10 @@
+## 0.3.0 — 2026-05-29
+
+ADDED:
+- Added `ToolSchema`, the canonical LLM-facing tool declaration shared by
+  workspace wrappers. `motosan-agent-tool::ToolDef` and `motosan_ai::Tool`
+  now compose this schema.
+
 ## 0.2.0 — 2026-05-29
 
 First deliberately breaking release since 0.1.0. Both changes are additive
