@@ -6,6 +6,8 @@ rust-version = "1.75"
 description = "Core types and abstract traits for the Motosan agent framework."
 license = "Apache-2.0"
 repository = "https://github.com/motosan-dev/motosan-agent-primitives"
+documentation = "https://docs.rs/motosan-agent-primitives"
+readme = "README.md"
 keywords = ["agent", "llm", "ai", "framework"]
 categories = ["api-bindings"]
 
