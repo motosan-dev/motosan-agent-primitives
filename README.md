@@ -39,11 +39,20 @@ dep" goal was relaxed once the Hook lifecycle gained cancellation support
 | Module      | Purpose                                                              |
 |-------------|----------------------------------------------------------------------|
 | `message`   | `Message`, `MessageId`, `Role`, `ContentBlock`, `ImageSource`, `DocumentSource` |
-| `tool`      | **Data only** — `ToolCall`, `ToolResult`, `ToolAnnotations`. The `Tool` trait lives in `motosan-agent-tool`. |
+| `tool`      | **Data only** — `ToolSchema`, `ToolCall`, `ToolResult`, `ToolAnnotations`. The `Tool` trait lives in `motosan-agent-tool`. |
 | `permission`| `Permission`, `PermissionPolicy` trait, `PermissionMode`, `PermissionContext` |
 | `hook`      | `Hook` trait, `HookResult`, `StopReason`, `ToolFailure`, nine lifecycle `*Ctx` structs |
 | `event`     | `AgentEvent` (10 variants), `SubagentResult` — streaming output       |
 | `memory`    | `MemorySchema`, `MemoryKey`, `MemoryKind` — schema only, no storage   |
+
+## ToolSchema
+
+Since v0.3.0, `ToolSchema { name, description, input_schema }` is the
+canonical LLM-facing tool declaration shared across the workspace.
+`motosan-agent-tool::ToolDef` adds host-side `internal_name`, and
+`motosan_ai::Tool` adds provider cache metadata; both wrappers flatten
+`ToolSchema` in serde so the wire shape remains `{ name, description,
+input_schema, ... }`.
 
 ## What does NOT live here
 

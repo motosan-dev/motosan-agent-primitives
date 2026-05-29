@@ -30,6 +30,38 @@ use serde::{Deserialize, Serialize};
 
 use crate::message::ContentBlock;
 
+/// Canonical LLM-facing tool declaration shared across the workspace: the
+/// `name`, human-readable `description`, and JSON-Schema `input_schema` the
+/// model sees. Layer-specific fields live on the wrappers —
+/// `motosan_agent_tool::ToolDef` adds the host-side `internal_name`, and
+/// `motosan_ai::Tool` adds the provider `cache` flag — both via
+/// `#[serde(flatten)]` so the on-the-wire shape is `{name, description,
+/// input_schema, ...}`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ToolSchema {
+    /// Model-visible tool name.
+    pub name: String,
+    /// Human-readable tool description shown to the model.
+    pub description: String,
+    /// JSON Schema object describing accepted tool input.
+    pub input_schema: serde_json::Value,
+}
+
+impl ToolSchema {
+    /// Build a tool schema from its model-visible name, description, and input schema.
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: serde_json::Value,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            input_schema,
+        }
+    }
+}
+
 /// An assistant-issued request to invoke a named tool.
 ///
 /// Mirrors `ContentBlock::ToolUse` but as a stand-alone wire type — useful
@@ -157,6 +189,21 @@ impl Default for ToolAnnotations {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn tool_schema_roundtrips_and_constructs() {
+        let s = ToolSchema::new("get_weather", "Fetch weather", serde_json::json!({"type":"object"}));
+        assert_eq!(s.name, "get_weather");
+        assert_eq!(s.description, "Fetch weather");
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json, serde_json::json!({
+            "name": "get_weather",
+            "description": "Fetch weather",
+            "input_schema": {"type":"object"}
+        }));
+        let back: ToolSchema = serde_json::from_value(json).unwrap();
+        assert_eq!(back, s);
+    }
 
     #[test]
     fn tool_call_round_trip() {
