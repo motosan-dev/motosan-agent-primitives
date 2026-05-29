@@ -16,7 +16,7 @@
 
 This feature spans four crates with a strict dependency order. It is **one coherent feature**, not independent subsystems, so it is one plan with four phases. Each phase is independently committable and testable.
 
-- **Phase 1 — primitives:** new `Reviewer` trait + `ApprovalRequest` + `ReviewDecision`. Purely additive (no existing item changes). Fully detailed below.
+- **Phase 1 — primitives:** ✅ **DONE (2026-05-29, primitives 0.4.0).** New `Reviewer` trait + `ApprovalRequest` + `ReviewDecision`. Purely additive (no existing item changes). Fully detailed below.
 - **Phase 2 — loop:** `DenyReviewer`, `DeferredAskUserReviewer` (wraps today's behavior), `EngineBuilder::reviewer()`, route `consult_policy` `AskUser` → reviewer, per-session serialization.
 - **Phase 3 — subagent:** `SubagentConfig::inherit_approval_from` sugar so a child's `AskUser` routes to the parent session's reviewer/ops channel (the actual gap).
 - **Phase 4 — agemo:** migrate the existing stdin bridge onto `DeferredAskUserReviewer` (behavior-preserving).
@@ -45,6 +45,14 @@ This feature spans four crates with a strict dependency order. It is **one coher
 ---
 
 ## Phase 1 — primitives: the `Reviewer` contract
+
+> **✅ COMPLETE — 2026-05-29.** Landed as **primitives 0.4.0**, pushed to origin/main. Strictly additive (4 files: `src/approval.rs` +168, `src/lib.rs` +2, CHANGELOG, Cargo.toml — no existing item touched). Verified green: 46 unit + 8 fixtures + 10 doctests (doctests link via the home-config `rustdocflags` fix). Review passed with no findings.
+> - [x] **Task 1** — `ReviewDecision { Approve, Deny { reason } }` (`a2f208f`)
+> - [x] **Task 2** — owned, cancellable `ApprovalRequest` (`58a9825`)
+> - [x] **Task 3** — `Reviewer` trait (by-value, object-safe) (`bde3187`)
+> - [x] **Task 4** — doctest + version bump to 0.4.0 (`1ec8ca3`)
+>
+> Deviations from the as-written tasks (intentional, all applied): P1 compile-time `Send+'static` assertion instead of `tokio::spawn`; P2 clean re-export (no fail-then-narrow dance); the doctest additionally covers the cancellation fail-closed path.
 
 Grounding (verified in current code, primitives 0.3.0):
 - `src/permission.rs`: `Permission::{Allow, Deny { reason }, AskUser { prompt: Option<String> }}`, `PermissionContext<'a>`, `PermissionPolicy::check`.
