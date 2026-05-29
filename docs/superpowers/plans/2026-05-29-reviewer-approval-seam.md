@@ -4,7 +4,7 @@
 
 **Goal:** Add a swappable, async, session-scoped `Reviewer` seam that resolves `Permission::AskUser` escalations — spanning pi-minimal (never escalate) to Codex-heavy (guardian agent, multi-agent child approval) on one contract.
 
-**Architecture:** Keep `PermissionPolicy` as the decision layer (`Allow | Deny | AskUser`, composed most-restrictive-wins). Add a new `Reviewer` trait in primitives that resolves an `AskUser` into `Approve | Deny { reason }`. In the loop, resolve `AskUser` through the session's reviewer — **preferred (spec §9a): the reviewer owns its I/O and `review()` is an `await` inside each tool call's per-call future, so the existing `join` gives non-blocking for free and the engine grows almost no new machinery** (§9b defer/resume is the fallback). The interactive human reviewer lives with the host (agemo); the loop ships only a fail-safe `DenyReviewer` default. Children share one reviewer (Phase 3) to close the child-`AskUser` gap.
+**Architecture:** Keep `PermissionPolicy` as the decision layer (`Allow | Deny | AskUser`, composed most-restrictive-wins). Add a new `Reviewer` trait in primitives that resolves an `AskUser` into `Approve | Deny { reason }`. In the loop, resolve `AskUser` through the session's reviewer — **chosen architecture is spec §9a: the reviewer owns its I/O and `review()` is an `await` inside each tool call's per-call future, so the existing `join` gives non-blocking for free and the engine grows almost no new machinery.** This replaces the loop's current event/op approval path (existing approval tests get rewritten — R1). The engine-mediated defer/resume alternative was rejected (spec §9c). The interactive human reviewer lives with the host (agemo); the loop ships only a fail-safe `DenyReviewer` default. Children share one reviewer (Phase 3) to close the child-`AskUser` gap.
 
 **Tech Stack:** Rust, `async-trait`, `tokio` / `tokio-util` (`CancellationToken`), `serde`. Crates: `motosan-agent-primitives` (0.3.0), `motosan-agent-loop`, `motosan-agent-subagent`, `agemo`.
 
@@ -17,7 +17,7 @@
 This feature spans four crates with a strict dependency order. It is **one coherent feature**, not independent subsystems, so it is one plan with four phases. Each phase is independently committable and testable.
 
 - **Phase 1 — primitives:** ✅ **DONE (2026-05-29, primitives 0.4.0).** New `Reviewer` trait + `ApprovalRequest` + `ReviewDecision`. Purely additive (no existing item changes). Fully detailed below.
-- **Phase 2 — loop:** spike §9a/§9b, `DenyReviewer`, `EngineBuilder::reviewer()`, resolve `AskUser` through the reviewer (§9a: review inside the per-call future → non-blocking via `join`). Interactive reviewer NOT here (host-owned, Phase 4).
+- **Phase 2 — loop:** §9a scoping spike (feasibility + migration surface), `DenyReviewer`, `EngineBuilder::reviewer()`, resolve `AskUser` through the reviewer (§9a: review inside the per-call future → non-blocking via `join`), and rewrite the displaced event/op approval tests (R1). Interactive reviewer NOT here (host-owned, Phase 4).
 - **Phase 3 — subagent:** `SubagentConfig::inherit_approval_from` sugar so a child's `AskUser` routes to the parent session's reviewer/ops channel (the actual gap).
 - **Phase 4 — agemo:** agemo provides its own host-owned `Reviewer` (owns stdin I/O) and wires it via `.reviewer(..)`, restoring interactive approval after the loop default became `DenyReviewer`.
 
@@ -296,21 +296,22 @@ git commit -m "feat: add Reviewer trait (approval-resolution seam)"
 
 ## Phase 2 — loop: reviewer wiring (A+B preferred)
 
-> **Architecture:** follow **spec §9**. Preferred is **§9a (A+B)** — the reviewer owns its I/O and `review()` is an `await` inside each tool call's per-call future, so `join` gives non-blocking for free and the engine grows almost nothing. **§9b (engine-mediated/defer-resume) is the documented fallback** only if the spike (Task 5) finds the per-call restructuring too invasive. Under §9a the **interactive (human) reviewer lives with the host (agemo, Phase 4), not the loop** — the loop only ships `DenyReviewer`.
+> **Architecture (decided):** **§9a (A+B)** per spec §9 — the reviewer owns its I/O and `review()` is an `await` inside each tool call's per-call future, so `join` gives non-blocking for free and the engine grows almost nothing. The engine-mediated defer/resume alternative is **rejected** (spec §9c); revisit only if the §9d scoping spike (Task 5) finds §9a structurally impossible. §9a **replaces** the loop's current `ExtensionEvent::AskUser`/`AgentOp::AskUserAnswer` approval path, so existing permission-approval tests are rewritten and agemo's bridge moves into a host-owned reviewer (R1). The interactive (human) reviewer lives with the host (agemo, Phase 4), not the loop — the loop only ships `DenyReviewer`. Approval **timeout** becomes the reviewer's job (R2). Verify event ordering unchanged (R4).
 
 Grounding (RE-VERIFY at pickup — loop is in active flux; line numbers may have drifted):
 - `src/core/engine.rs`: the `consult_policy(...)` match — `Allow` (emit ToolStarted + dispatch), `Deny { reason }` (resolved error slot), `AskUser { prompt }` (today: emit `ExtensionEvent::AskUser` + `deferred_calls` + resolve via `AgentOp::AskUserAnswer`). Find how per-call futures are composed and joined (`execute_tools_parallel` / `resolve_deferred_slots` / `join!`).
 - `EngineBuilder` setters (`permission_policy`, `session_id`, …) and `Engine`/`build()`.
 - `src/core/permission_runtime.rs`: `consult_policy(...) -> Permission`; `default_prompt(name, args)`.
 
-### Task 5: SPIKE — decide §9a vs §9b (timeboxed, ~half day)
+### Task 5: SPIKE — scope §9a (feasibility + migration surface; timeboxed, ~half day)
 
-**Goal:** determine whether `Permission::AskUser` can be resolved by `reviewer.review(req).await` **inside the per-call future** (so the existing `join` over per-call futures provides non-blocking, with no new slot/select/spawn).
+§9a is the decided architecture; this spike **scopes** it, it does not choose between architectures.
 
-- Read how a tool call flows from `consult_policy` → slot → execution today, and whether the permission decision can move INTO the per-call async chain (`policy.check → if AskUser { reviewer.review } → execute`) rather than the separate intercept→`resolve_deferred_slots` phase.
-- **Decision rule:** if folding in is feasible without a large restructure → **§9a**. If the intercept/resolve split resists → **§9b** (keep defer/resume; spawn `review()`, add a `DeferredReview` slot + `select!`, forward `AgentOp::AskUserAnswer` to the reviewer; mutex inside the reviewer).
-- Output: a short note in the commit / a scratch doc recording which route and why. No production code need land in this task.
-- **Commit (optional):** `chore(loop): spike — reviewer integration route (§9a vs §9b)`.
+- **Feasibility:** read how a tool call flows from `consult_policy` → slot → execution today, and confirm the permission decision can move INTO the per-call async chain (`policy.check → if AskUser { reviewer.review } → execute`) joined like the other per-call futures, rather than the separate intercept→`resolve_deferred_slots` phase. (If it proves *structurally impossible*, escalate — the rejected §9b in spec §9c is the only bridge; do not silently switch.)
+- **Migration surface (R1):** enumerate the existing permission-approval tests that assert the `ExtensionEvent::AskUser` → `AgentOp::AskUserAnswer` round-trip (they will be rewritten), and the agemo code that drives it (moves into a host-owned reviewer in Phase 4). List them so Task 7 / Phase 4 budget the rewrite.
+- **Event ordering (R4):** note where ToolStarted etc. fire today so Task 7 preserves the order.
+- Output: a short scoping note recorded in the commit / a scratch doc. No production code need land here.
+- **Commit (optional):** `chore(loop): scope §9a reviewer integration + migration surface`.
 
 ### Task 6: `DenyReviewer` + `EngineBuilder::reviewer()`
 
@@ -318,7 +319,7 @@ Grounding (RE-VERIFY at pickup — loop is in active flux; line numbers may have
 
 - Implement `DenyReviewer` → `ReviewDecision::Deny { reason: "no reviewer configured".into() }`. No shared state, no lock.
 - Add `reviewer: Option<Arc<dyn Reviewer>>` to `EngineBuilder` + `Engine`; setter `pub fn reviewer(mut self, r: Arc<dyn Reviewer>) -> Self` next to `permission_policy`; `build()` defaults to `Arc::new(DenyReviewer)`; add a `reviewer()` accessor.
-- **Do NOT build an interactive/`DeferredAskUserReviewer` here** — under §9a that reviewer owns stdin/UI I/O and belongs to the host (agemo, Phase 4). (If the spike chose §9b, the engine-coupled deferred reviewer is built here instead, holding the ops/answer handles — note that in the commit.)
+- **Do NOT build an interactive reviewer here** — under §9a that reviewer owns stdin/UI I/O and belongs to the host (agemo, Phase 4). The loop ships only `DenyReviewer`.
 - **Tests:** `DenyReviewer` returns `Deny`; builder stores the reviewer; unset → `DenyReviewer`.
 - **Commit:** `feat(loop): DenyReviewer + EngineBuilder::reviewer() (default DenyReviewer)`.
 
@@ -327,15 +328,15 @@ Grounding (RE-VERIFY at pickup — loop is in active flux; line numbers may have
 **Files:** Modify `engine.rs` + add `permission_runtime::approval_request_from(...)`.
 
 - Add `approval_request_from(...)` building an OWNED `ApprovalRequest` (clone `tool_call`, `annotations`, `session_id`, the already-computed `recent_messages_owned`, `prompt`, plus the engine's `cancellation_token`).
-- **§9a (preferred):** fold the decision into the per-call future — `match policy.check { Allow => execute, Deny => error, AskUser { prompt } => match reviewer.review(approval_request_from(..)).await { Approve => execute, Deny { reason } => error } }`. The batch's existing `join` runs these concurrently, so a suspended `review()` (awaiting a human) does NOT block sibling `Allow` calls — **non-blocking for free, no `tokio::spawn`** (P4 satisfied structurally).
-- **§9b (fallback only):** if the spike chose it, route through the kept defer/resume: spawn `review()`, add a `DeferredReview` slot, `select!` its result in `resolve_deferred_slots`, abort the handle on cancel.
+- **§9a (the design):** fold the decision into the per-call future — `match policy.check { Allow => execute, Deny => error, AskUser { prompt } => match reviewer.review(approval_request_from(..)).await { Approve => execute, Deny { reason } => error } }`. The batch's existing `join` runs these concurrently, so a suspended `review()` (awaiting a human) does NOT block sibling `Allow` calls — **non-blocking for free, no `tokio::spawn`** (P4 satisfied structurally).
+- **Migration (R1):** this removes the `ExtensionEvent::AskUser` → `deferred_calls` → `AgentOp::AskUserAnswer` path for *permission* approval (leave the `ask_user` *extension*'s use of it intact, F6). Rewrite the permission-approval tests the Task 5 spike enumerated to drive a test `Reviewer` instead of feeding answer ops. (Only if the spike found §9a structurally impossible would the rejected §9c defer/resume route apply — escalate first, don't switch silently.)
 - **P3 (serialization) — same either way:** the per-session mutex lives **inside the shared reviewer** (around its critical section), NOT the Engine — because parent + children share one reviewer instance (Phase 3) and a per-Engine lock wouldn't serialize across them. `DenyReviewer` needs none.
 - **Map decisions:** `Approve` → the existing `Allow` path (emit ToolStarted + dispatch); `ReviewDecision::Deny { reason }` → the existing `Permission::Deny` resolved-error slot.
 - **Tests:** (a) `AskUser` + `AlwaysApprove` → tool runs; (b) `AskUser` + default `DenyReviewer` → blocked; (c) **P4 non-blocking:** a batch with one `Allow` and one `AskUser` whose reviewer awaits a token you never fire → assert the `Allow` completes, then cancel to unwind; (d) **P3 serialization:** two engines sharing one reviewer, both escalate → recording reviewer asserts its critical section is entered serially; (e) **pi-parity:** a recording reviewer asserts `review()` is never called when the policy returns only `Allow`/`Deny`. Reuse `tests/permission_parallel_batch.rs` patterns.
 - **F7:** the new `DenyReviewer` default replaces today's stall-on-unanswered-`AskUser`; document in the loop CHANGELOG. agemo's interactive behavior is restored in Phase 4 (its host-owned reviewer).
 - **Commit:** `feat!(loop): resolve AskUser via Reviewer (§9a: review inside per-call future)`.
 
-**Phase 2 acceptance:** `cargo build/test --all-features` green in loop; existing permission/parallel-batch/ask_user tests pass (adjusted for the new `DenyReviewer` default where they relied on stall behavior); the spike's route is recorded.
+**Phase 2 acceptance:** `cargo build/test --all-features` green in loop; the §9a scoping note + migration list (Task 5) recorded; the displaced permission-approval tests rewritten to drive a `Reviewer` (R1); remaining permission/parallel-batch/`ask_user`-extension tests pass; event ordering unchanged (R4).
 
 ---
 
@@ -366,7 +367,7 @@ Grounding: `agemo/src/main.rs` already bridges the root engine's `AskUser` event
 **Files:** Modify `agemo/src/main.rs`.
 
 - Implement an agemo-local `Reviewer` (e.g. `StdinReviewer`) whose `review(req)` does what agemo's bridge does today — prompt the user (its own stdout/stdin or its existing wire-event emit + answer read) and map the answer to `Approve`/`Deny { reason }`, racing `req.cancellation_token`. It **owns its I/O** (does not depend on engine internals). Pass it via `.reviewer(Arc::new(...))` on the builder, restoring interactive approval after the loop default became `DenyReviewer`.
-- (If the spike chose §9b, agemo instead receives/uses the engine-coupled deferred reviewer the loop exposes — note which in the commit.)
+- Move agemo's current `permission_timeout_secs` into this reviewer (R2): `review()` races a timeout against the answer and returns `Deny` on expiry.
 - Confirm the existing finance smoke test (`AGEMO_STUB_PROVIDER=1 cargo run -- --harness finance --prompt "..."`) still completes and the audit `session_id` correlation still holds.
 - **Test/verify:** run the smoke test; assert an `AskUser`-triggering tool still prompts and resolves.
 - **Commit:** `feat(agemo): host-owned Reviewer for interactive approval`.
@@ -386,5 +387,5 @@ Grounding: `agemo/src/main.rs` already bridges the root engine's `AskUser` event
 
 - **Spec reconciled (P6):** spec §3 now uses `ReviewDecision::Deny { reason }` (richer, matches `Permission::Deny`), aligned with this plan. No remaining drift.
 - **Default choice:** default is `DenyReviewer` (fail-safe); hosts opt into their own reviewer (e.g. agemo's host-owned stdin reviewer, §9a). Documented as a behavior change vs today's stall (spec F7).
-- **Integration route:** Phase 2 spikes §9a (review inside the per-call future — preferred, minimal engine growth) vs §9b (engine-mediated defer/resume — fallback). See spec §9.
+- **Integration route (decided):** §9a — review inside the per-call future (spec §9a). The defer/resume alternative is rejected (§9c); Phase 2's spike only *scopes* §9a + its migration. §9a replaces the event/op approval path (R1: rewrite those tests), moves approval timeout into the reviewer (R2), and must preserve event ordering (R4).
 - **Moving target:** Phases 2–4 reference current `engine.rs` line numbers/handles; re-verify against the then-current code at pickup (loop is in active flux).
