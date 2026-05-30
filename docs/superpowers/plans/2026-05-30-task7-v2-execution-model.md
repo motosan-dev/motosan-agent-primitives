@@ -71,7 +71,11 @@ This is **not** a new abstraction — it is today's `resolve_deferred_slots` evo
 ```rust
 match op {
     // ── turn-level ──
-    Interrupt            => cancel.cancel(),                 // (today: ops_state.interrupted = true)
+    // Interrupt MIRRORS TODAY (zero behavior change): set the turn-level interrupt
+    // flag applied at the iteration boundary (as `apply_op` does) AND, ONLY if there
+    // are outstanding waiters, emit `Interrupted` + resolve them as errors (as today's
+    // deferred-wait path). Do NOT eagerly cancel everything when there are no waiters.
+    Interrupt            => { ops_state.set_interrupted(); if waiters.any_outstanding() { emit(Interrupted); waiters.error_all(Interrupted) } }
     InjectUserMessage(m) => turn_queue.push_message(m),      // applied at the next iteration boundary
     InjectHint(h)        => turn_queue.push_hint(h),         // (same)
     // ── per-call defer/resume: drive on_op (the MATCHER), deliver its resume to the waiter ──
@@ -97,6 +101,7 @@ match op {
 - **Route ALL resume variants (finding A):** any `OpDecision` that resolves a deferred call — approve, **reject**, etc. — must `deliver`. The fall-through is ONLY for decisions that wake no call. A resume in the fall-through = a hung call.
 - **Matching stays in the interceptors** (explicit-id / wildcard-FIFO / pre-buffer / no-pending live in `on_op`) — keeps the existing tests green.
 - **Dual registration, keyed by `call.id` (finding B):** a defer registers in **two** synced places — (1) the **interceptor's interior pending-state** (for *matching*), (2) the **`WaiterRegistry[call.id]`** (for *wakeup*). Flow: `intercept_tool_call` returns `Defer` (interceptor records pending) + the call registers its waiter; an answer op → `on_op` matches → returns the `call_id` → the loop delivers to `waiters[call_id]`. An **answer before the waiter is registered** is held by the interceptor's **pre-buffer** and matched on the next `on_op`.
+- **Pending/defer ordering MUST be canonical tool-call order, not runtime registration order (A.2 finding #2).** Today's sequential pre-pass records pending defers in request order, and **wildcard-FIFO** matching ("answer with no `call_id` → oldest pending call") depends on that order. v2's per-call futures register CONCURRENTLY, so push-back/registration order is non-deterministic. To preserve the wildcard semantics: build a **canonical index map from `items` at batch start**, and order the pending-defer state by that index — NOT by which future happened to register first. Otherwise a wildcard answer matches the wrong call (a behavior change).
 - **Error channel:** `on_op` `Err` only happens under `ErrorPolicy::Abort`; treat it as a **terminal turn error** (record + cancel, mirroring `AbortedByHook`), NOT log-and-continue.
 
 ### Component 3 — two waits, two owners (the decoupling)
