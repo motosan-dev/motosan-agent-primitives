@@ -272,21 +272,26 @@ A read-only spike on `motosan-agent-loop` sized the §9a refactor. **Verdict: LA
 
 If Motosan later grows an app-server / remote driver, the structured request/response protocol (Codex's SQ/EQ) lives inside a **`ChannelReviewer`** impl: its `review()` emits an event over the wire and awaits a response the client resolves. The trait, engine, and policies are untouched — the wire protocol is one reviewer's concern, not an engine guarantee. Sharing one `ChannelReviewer` across all engines/children gives the uniform, can't-bypass protocol Codex enforces at the engine level — by convention here, which suits a multi-vertical framework.
 
-### 9f. Spectrum coverage: pi and Codex both map onto this architecture
+### 9f. Spectrum coverage — pi fully; Codex's *swappable-reviewer idea*, NOT its full approval system
 
-The whole point is one contract spanning pi-minimal → Codex-heavy. Verified mapping:
+> Detailed source-verified analysis: [APPROVAL_PI_CODEX_CAPABILITY_STUDY.md](../../APPROVAL_PI_CODEX_CAPABILITY_STUDY.md) (2026-05-30). An earlier version of this table read too optimistically ("every Codex mechanism maps"); corrected below.
 
-| Capability | pi | Codex | How it lands on this design |
+The Reviewer seam delivers **pi in full** and Codex's **"who answers an escalation, swappably"** idea. It does **not** deliver Codex's full approval *system* (an exec-centric, three-axis, policy-mutating design). Verified mapping (✅ delivered / ⚠️ by convention / ❌ separate future work):
+
+| Capability | pi | Codex | This design |
 |---|---|---|---|
-| block / allow a call | `beforeToolCall → {block}` | execpolicy / sandbox | `Hook::pre_tool_use` (Abort) or policy `Deny` — no reviewer needed |
-| ask a human | `await confirm()` in the hook | SQ/EQ event → `oneshot` → response op | policy `AskUser` + a reviewer whose `review()` awaits the host's channel (§9a) — **pi's `confirm()` is literally a `review()`** |
-| reviewer is an agent | — | guardian sub-agent | `GuardianReviewer::review()` runs a sub-agent turn |
-| central sink for many agents | — (no sub-agents) | one approval sink | children share one `Arc<dyn Reviewer>` (§8) |
-| structured remote protocol | — | engine-enforced SQ/EQ | a shared `ChannelReviewer` (§9e) — convention, more flexible |
-| "don't ask again this session" | — | `ApprovedForSession` | a stateful reviewer remembers internally |
-| three-axis security | — | execpolicy + sandbox + AskForApproval | orthogonal: policy (decision) + reviewer (who answers) + sandbox (separate) |
+| block / allow a call | ✅ `beforeToolCall → {block}` | ✅ | ✅ `pre_tool_use` Abort or policy `Deny` |
+| ask a human | ✅ `await confirm()` | ✅ SQ/EQ → response op | ✅ a reviewer whose `review()` awaits the host channel (§9a) — pi's `confirm()` *is* a `review()` |
+| reviewer is an agent (guardian) | — | ✅ | ✅ `GuardianReviewer::review()` (needs Phase 3 subagent) |
+| central sink for many agents + inheritance | — | ✅ | ✅ shared `Arc<dyn Reviewer>` (§8, Phase 3) |
+| swappable reviewer | — | ✅ | ✅ — this is the seam |
+| engine-enforced / can't-bypass | n/a | ✅ engine | ⚠️ **convention** (share one reviewer), not enforced |
+| "don't ask again this session" | — | ✅ `ApprovedForSession` | ✅ a stateful reviewer can remember |
+| **execpolicy** (auto-safe command rules) | — | ✅ | ❌ not modeled (Motosan is generic per-tool; no execpolicy) |
+| **OS sandbox in the approval path** | — | ✅ `SandboxPolicy` | ❌ `motosan-sandbox` exists but is **not wired** |
+| **policy-mutating decisions** (persist execpolicy/network rule) | — | ✅ 7-variant `ReviewDecision` | ❌ `Approve\|Deny` only; **no policy layer to amend** |
 
-**pi is the degenerate case** of this design (single agent, reviewer = `confirm()`). **Every Codex mechanism** maps to a reviewer impl plus the sharing convention, with the engine staying minimal. Nothing in either reference point is inexpressible here.
+**pi is a strict subset** of this design. For **Codex**, the swappable-reviewer mechanism maps, but its full approval system — exec-centric **execpolicy + OS sandbox + policy-mutating `ReviewDecision`**, engine-enforced — is a **separate, larger track** (execpolicy-equivalent + sandbox wiring + a richer decision/policy-feedback layer), out of scope for the Reviewer seam. See the study for what building it would take.
 
 ## 10. Testing strategy
 
