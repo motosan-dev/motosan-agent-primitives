@@ -311,7 +311,9 @@ Grounding (RE-VERIFY at pickup — loop is in active flux; line numbers may have
 - **Hard constraints:** the `ask_user` *extension* reuses the same `ExtensionEvent::AskUser` + `AgentOp::AskUserAnswer` — those STAY (F6); only the *permission* use is removed. The streaming-eager path uses `tokio::spawn` (`src/streaming_executor.rs`) — §9a must handle it (the pure-`join` story doesn't cover it).
 - Migration list + agemo bridge: see spec §9d.
 
-### Task 6: `DenyReviewer` + `EngineBuilder::reviewer()`
+### Task 6: `DenyReviewer` + `EngineBuilder::reviewer()` ✅ DONE (loop@`ee9fec4`)
+
+Landed and reviewed clean: additive only (the AskUser/pipeline path untouched, all existing approval tests pass unchanged); `DenyReviewer` + `EngineBuilder::reviewer()` setter/field/default/accessor; dormant until Task 7.
 
 **Files:** Create `motosan-agent-loop/src/core/reviewer.rs` (`mod reviewer;` in `src/core/mod.rs`); modify `engine.rs`.
 
@@ -321,19 +323,13 @@ Grounding (RE-VERIFY at pickup — loop is in active flux; line numbers may have
 - **Tests:** `DenyReviewer` returns `Deny`; builder stores the reviewer; unset → `DenyReviewer`.
 - **Commit:** `feat(loop): DenyReviewer + EngineBuilder::reviewer() (default DenyReviewer)`.
 
-### Task 7: resolve `AskUser` through the reviewer
+### Task 7: resolve `AskUser` through the reviewer — ⚠️ v1 BOTCHED & REVERTED; redo design-first
 
-**Files:** Modify `engine.rs` + add `permission_runtime::approval_request_from(...)`.
+**v1 attempt (2026-05-30) failed:** it patched the shared two-phase pipeline incrementally; each blocking-point fix exposed another entangled wait (permission review vs `ask_user` extension defer vs streaming chunks vs sibling resume). Tests went green but with latent concurrency bugs ("green but wrong"). It was **reverted** — loop `main` is back at clean Task 6 (`ee9fec4`); the dead-end is preserved at branch `wip/task7-v1-botched`.
 
-- Add `approval_request_from(...)` building an OWNED `ApprovalRequest` (clone `tool_call`, `annotations`, `session_id`, the already-computed `recent_messages_owned`, `prompt`, plus the engine's `cancellation_token`).
-- **§9a (the design) — LARGE pipeline refactor, surface in spec §9d.** Fold the decision into the per-call future — `match policy.check { Allow => execute, Deny => error, AskUser { prompt } => match reviewer.review(approval_request_from(..)).await { Approve => execute, Deny { reason } => error } }`. This is **not** a local edit: rebuild the two-phase slot/resolve pipeline (the ~8 `dispatch_tool_call_to_slot` sites + `execute_tools_with_policy` / `resolve_and_execute_intercepted_slots` / `execute_tools_parallel` / `resolve_and_combine_preexecuted_slots`) into per-call futures, and remove the permission-specific `InterceptedSlot::DeferredPermission` path. Once folded, the batch `join` keeps suspended `review()`s from blocking sibling `Allow` calls (P4) — this preserves the non-blocking the resolver/executor join already gave, it is not a new free win.
-- **Streaming-eager path (spec §9d):** `src/streaming_executor.rs` uses `tokio::spawn`, so the pure-`join` non-blocking story does not cover it — handle approval on that path explicitly (its own per-call `review()` await before the spawned execution, or equivalent). Add a streaming-path test.
-- **Migration (R1):** this removes the `ExtensionEvent::AskUser` → `deferred_calls` → `AgentOp::AskUserAnswer` path for *permission* approval (leave the `ask_user` *extension*'s use of it intact, F6). Rewrite the permission-approval tests the Task 5 spike enumerated to drive a test `Reviewer` instead of feeding answer ops.
-- **P3 (serialization) — same either way:** the per-session mutex lives **inside the shared reviewer** (around its critical section), NOT the Engine — because parent + children share one reviewer instance (Phase 3) and a per-Engine lock wouldn't serialize across them. `DenyReviewer` needs none.
-- **Map decisions:** `Approve` → the existing `Allow` path (emit ToolStarted + dispatch); `ReviewDecision::Deny { reason }` → the existing `Permission::Deny` resolved-error slot.
-- **Tests:** (a) `AskUser` + `AlwaysApprove` → tool runs; (b) `AskUser` + default `DenyReviewer` → blocked; (c) **P4 non-blocking:** a batch with one `Allow` and one `AskUser` whose reviewer awaits a token you never fire → assert the `Allow` completes, then cancel to unwind; (d) **P3 serialization:** two engines sharing one reviewer, both escalate → recording reviewer asserts its critical section is entered serially; (e) **pi-parity:** a recording reviewer asserts `review()` is never called when the policy returns only `Allow`/`Deny`. Reuse `tests/permission_parallel_batch.rs` patterns.
-- **F7:** the new `DenyReviewer` default replaces today's stall-on-unanswered-`AskUser`; document in the loop CHANGELOG. agemo's interactive behavior is restored in Phase 4 (its host-owned reviewer).
-- **Commit:** `feat!(loop): resolve AskUser via Reviewer (§9a: review inside per-call future)`.
+**Redo is DESIGN-FIRST and specified separately:** see **[2026-05-30-task7-v2-execution-model.md](2026-05-30-task7-v2-execution-model.md)**. The lesson: a LARGE concurrency rebuild must (1) draw the per-call execution model, (2) get it reviewed, (3) land the *structural* rewrite with zero behavior change and the full suite green, and only THEN add the reviewer — never incrementally patch the shared batch resolver.
+
+The v2 doc carries the full plan; in summary it: makes each tool call **one self-contained future** (permission check/review → interceptor dispatch incl. ask_user defer → execute), has the batch only `join_all` them, replaces the batch-level `resolve_deferred_slots` with an **ops router** that wakes the specific waiting call, unifies the streaming path onto the same future, keeps the `ask_user` extension on `AgentOp::AskUserAnswer` (only the permission use is removed, F6), and makes `architectural_invariants.rs` symbolic. Hard constraints, migration list (R1), and the P3/P4/event-ordering tests are in that doc.
 
 **Phase 2 acceptance:** `cargo build/test --all-features` green in loop; the §9a scoping note + migration list (Task 5) recorded; the displaced permission-approval tests rewritten to drive a `Reviewer` (R1); remaining permission/parallel-batch/`ask_user`-extension tests pass; event ordering unchanged (R4).
 
