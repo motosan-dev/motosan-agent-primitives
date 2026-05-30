@@ -59,7 +59,7 @@ async fn run_tool_call(call, ctx) -> ToolOutput {
 }
 ```
 
-Every wait (review, ask_user answer) lives **inside** the call's own future, so `FuturesUnordered` advances siblings whenever one suspends. Cross-call blocking is not expressible — structural immunity to the v1 bug class.
+Every wait (review, defer/resume) lives **inside** the call's own future, so the batch advances siblings whenever one suspends (order-preserving join / reassembly — see Component 4). Cross-call blocking is not expressible — structural immunity to the v1 bug class.
 
 ### Component 2 — per-turn ops dispatcher: the sole `ops_rx` consumer, routing all variants
 
@@ -68,19 +68,27 @@ The dispatcher **subsumes both** of today's op readers — `drain_ops` (try_recv
 ```rust
 match op {
     // ── turn-level (NOT per-call) ──
-    Interrupt          => self.cancel_token.cancel(),              // cancel the turn
-    InjectUserMessage(m) => self.turn_queue.push_message(m),       // applied at the next iteration boundary
-    InjectHint(h)      => self.turn_queue.push_hint(h),            // (same)
-    // ── per-call (the generic defer/resume) ──
-    AskUserAnswer{call_id, answer} => self.waiters.deliver(call_id, answer),  // ask_user extension waiter
-    ApprovePlan{..}                => self.waiters.deliver(..),               // planning waiter
-    ExtensionResume{call_id, ..}   => { interceptor.on_op(&op); self.waiters.deliver(call_id, ..) }, // keep on_op side effects
+    Interrupt            => self.cancel_token.cancel(),          // cancel the turn
+    InjectUserMessage(m) => self.turn_queue.push_message(m),     // applied at the next iteration boundary
+    InjectHint(h)        => self.turn_queue.push_hint(h),        // (same)
+    // ── per-call defer/resume: route THROUGH the interceptor on_op chain (the MATCHER) ──
+    AskUserAnswer{..} | ApprovePlan{..} | ExtensionResume{..} => {
+        // The interceptor SET owns the matching semantics (explicit call_id /
+        // wildcard FIFO / pre-buffer / no-pending). on_op is SHORT — it takes the
+        // interceptor-set lock briefly and NEVER awaits. The dispatcher only routes
+        // its decision to the right per-call channel.
+        match self.interceptors.on_op(&op) {        // dispatcher holds the interceptor-set handle
+            Resume { call_id, result } => self.waiters.deliver(call_id, result),
+            Buffered | NotMine         => {}         // matcher kept it / not a resume
+        }
+    }
 }
 ```
 
-- **`waiters`**: a per-turn registry `Mutex<HashMap<CallId, oneshot::Sender>>` + an unmatched-answer **buffer** + **wildcard FIFO** + **pre-buffer** (these replicate today's `ask_user`/defer semantics — the existing tests are the spec).
-- **Two routing kinds matter:** `Interrupt`/`Inject*` are **turn-level** (cancel token / a pending message+hint queue applied at iteration boundaries) — they are NOT per-call waiters. `AskUserAnswer`/`ApprovePlan`/`ExtensionResume` are **per-call** defer resumes routed by `call_id`. (Today: `drain_ops`→`apply_op` handles Inject*/Interrupt; `resolve_deferred_slots`→`on_op` handles the defers. The dispatcher merges both.)
-- This splits today's `resolve_deferred_slots` (which couples "drain ops" + "resolve batch slots") into **dispatcher routes ops** + **each call awaits its own waiter**.
+- **Matching stays in the interceptors (do NOT re-implement it in the dispatcher).** Today `AskUserInterceptor::on_op` / `PlanningInterceptor::on_op` own explicit-id / wildcard-FIFO / pre-buffer / no-pending semantics. v2 keeps them there; the dispatcher just drives `on_op` and delivers its `Resume{call_id}` to that call's waiter. This is the lowest-risk path and what keeps the existing defer/ask_user/planning tests green.
+- **`waiters`**: a per-turn registry `Mutex<HashMap<CallId, oneshot::Sender>>` — only the per-call wakeup channels, no matching logic.
+- **Lock discipline (correctness core, no deadlock):** the **call** side (`run_tool_call` step 2) takes the interceptor-set lock, gets `Defer`, **releases the lock, THEN awaits** its waiter. The **dispatcher** side calls `on_op` holding the lock only **briefly and without awaiting**. Neither holds the interceptor-set lock across an `await`.
+- **Two routing kinds:** `Interrupt`/`Inject*` are **turn-level** (cancel token / a pending message+hint queue applied at iteration boundaries), NOT per-call. `AskUserAnswer`/`ApprovePlan`/`ExtensionResume` are **per-call** resumes (matched by the interceptors, delivered by `call_id`). (Today `drain_ops`→`apply_op` does Inject*/Interrupt; `resolve_deferred_slots`→`on_op` does the defers — the dispatcher merges both.)
 
 ### Component 3 — two waits, two owners (the decoupling)
 
