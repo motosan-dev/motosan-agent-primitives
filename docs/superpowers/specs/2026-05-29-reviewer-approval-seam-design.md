@@ -28,7 +28,7 @@ Two reference points bracket the design space:
 One framework that spans **both ends** without forcing the heavy machinery on the simple case:
 
 - **pi end:** a user who never escalates pays nothing new — existing `pre_tool_use` / `Allow|Deny` policy is the whole story.
-- **Codex end:** a user can plug in interactive human review, a guardian-agent reviewer, escalation pipelines, and sub-agent approval that flows back to one central answering point.
+- **Codex end:** a user can plug in interactive human review, a guardian-agent reviewer, escalation pipelines, and sub-agent approval that flows back to one central answering point. (This is Codex's *swappable-reviewer* idea — **not** its full exec-centric three-axis approval system, which is out of scope; see §9f for the precise boundary.)
 - Same contract across the spectrum; going remote later swaps an implementation, not the contract.
 
 ### Non-goals (YAGNI)

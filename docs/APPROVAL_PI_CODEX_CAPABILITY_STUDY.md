@@ -19,7 +19,7 @@
 - **The whole gate is binary:** `BeforeToolCallResult { block?: boolean; reason?: string }` (`packages/agent/src/types.ts`). No richer decision, no amendment, no session cache.
 - **Human approval = a UI primitive returning a boolean:** the coding-agent extension exposes `confirm(title, message): Promise<boolean>` (`packages/coding-agent/src/core/extensions/types.ts:129`); an extension calls it inside `beforeToolCall` and returns `{ block: !ok }`.
 - **No sub-agents / multi-agent** in the core (the spawn/delegate grep hits are process-spawn in `bash.ts` etc., not agents).
-- **No sandbox in the approval path** (a `bun/restore-sandbox-env.ts` exists for the runtime, but it is not an approval-integrated sandbox).
+- **No sandbox of its own.** `bun/restore-sandbox-env.ts` is a *workaround for being run INSIDE an external sandbox* (e.g. `nono`): bun's compiled-binary `process.env` is empty there, so pi recovers it from `/proc/self/environ`. That confirms pi has no sandbox itself and none wired to the `beforeToolCall` gate; tool execution is otherwise unsandboxed.
 
 **Mapping to Motosan:** pi's `block/allow` = a `PermissionPolicy` returning `Deny`/`Allow` or a `Hook::pre_tool_use` `Abort`; pi's `confirm()` = a `Reviewer::review()` awaiting a host confirm. Motosan's `Allow|Deny|AskUser` + `Reviewer` is strictly more expressive. **No gap.**
 
@@ -81,12 +81,13 @@ The approve-with-amendment variants **feed the decision back into execpolicy / n
 | binary block / allow | ✅ (the whole thing) | ✅ (a sub-case) | ✅ `PermissionPolicy` Deny/Allow |
 | ask a human | ✅ `confirm()` | ✅ | ✅ a `Reviewer` awaiting the host channel |
 | reviewer is an agent (guardian) | — | ✅ | ✅ (needs Phase 3 subagent) |
-| multi-agent central sink + inheritance | — | ✅ | ✅ (shared `Arc<dyn Reviewer>`, Phase 3) |
+| multi-agent central sink + inheritance | — | ✅ (per `multi_agents.rs` module doc) | ✅ (shared `Arc<dyn Reviewer>`, Phase 3) |
 | **swappable reviewer** | — | ✅ | ✅ — this is exactly the seam |
+| "don't ask again this session" (`ApprovedForSession`) | — | ✅ | ✅ a stateful reviewer can remember (simplified — Codex's session-cache *matching* is richer) |
 | **engine-enforced / can't-bypass** | n/a | ✅ engine | ⚠️ **convention** (share one reviewer), not enforced |
 | **exec/patch-centric execpolicy (auto-safe rules)** | — | ✅ | ❌ not modeled (Motosan is generic per-tool; no execpolicy) |
 | **OS sandbox in the approval path** | — | ✅ | ❌ crate exists, **not wired** |
-| **policy-mutating decisions** (persist execpolicy / network rule, approve-for-session) | — | ✅ 7-variant `ReviewDecision` | ❌ `Approve\|Deny` only; **no policy layer to amend** |
+| **policy-mutating decisions** (persist execpolicy / network rule) | — | ✅ 7-variant `ReviewDecision` | ❌ `Approve\|Deny` only; **no policy layer to amend** |
 
 **Conclusion:** the Reviewer seam matches Codex's *"who answers an escalation, swappably"* idea — that part is sound and the channel exists. But **Codex's full approval system is much larger**: an exec-centric three-axis design (execpolicy + sandbox + policy-mutating decisions), engine-enforced. Delivering that in Motosan would require, as separate efforts:
 
