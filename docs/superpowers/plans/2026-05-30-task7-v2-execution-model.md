@@ -18,13 +18,13 @@ Today's engine is two-phase: a sequential slot **pre-pass** (`dispatch_tool_call
 
 ### Target shape
 
-No pre-pass, no batch resolver, no `InterceptedSlot` zoo. Two concurrent things per turn:
+No pre-pass, no batch resolver, no `InterceptedSlot` zoo. Per **turn/run** (Batch 0 confirmed `ops_rx` is per-run, not per-session): a single **per-turn ops dispatcher** owns that run's `ops_rx` and lives across all the run's iterations/batches; each batch runs `run_tool_call` futures that register waiters with it. The dispatcher is a **scoped task stopped/aborted at turn terminal** — **NOT** `join!`'d with the batch (a `join!(dispatcher.run(rx), batch)` would hang, because the dispatcher loops on `rx` until close while `join!` waits for both):
 
 ```
-turn = join!(
-    ops_dispatcher.run(ops_rx),                    // SINGLE owner of ops_rx
-    run_all_calls(),                               // FuturesUnordered<run_tool_call(call)>
-)
+// per turn:
+let dispatcher = OpsDispatcher::spawn(ops_rx, cancel_token);   // sole ops_rx consumer for the run
+... each batch: let results = run_batch(calls, &dispatcher).await;  // run_tool_call futures, order-preserving
+dispatcher.shutdown();                                          // abort at turn terminal — do NOT join! it
 ```
 
 ### Component 1 — `run_tool_call`: one self-contained future per call
@@ -40,11 +40,15 @@ async fn run_tool_call(call, ctx) -> ToolOutput {
             Deny { reason } => return error_output(call.id, reason),
         }
     }
-    // 2. INTERCEPTORS (pre). If this tool is `ask_user`, the interceptor registers
-    //    a waiter[call.id] with the dispatcher and awaits it (racing timeout + cancel).
-    match ctx.interceptors.pre_tool_use(call, &ctx).await {
+    // 2. INTERCEPTORS (pre). Any interceptor may return ToolDecision::Defer (the
+    //    GENERIC defer protocol — ask_user AND planning AND external extensions use
+    //    it, not just ask_user). On Defer, register a waiter[call.id] with the
+    //    dispatcher and await ResumeDeferred (racing timeout + cancel).
+    //    ⚠️ Do NOT hold the interceptor-set mutex across this await.
+    match ctx.interceptors.pre_tool_use(call, &ctx).await {  // ctx exposes a dispatcher/waiter handle
         Continue(call)       => { /* execute */ }
-        ShortCircuit(output) => return output,     // e.g. ask_user resolves to a result here
+        Defer                => { let answer = ctx.waiters.register_and_wait(call.id).await?; /* resume */ }
+        ShortCircuit(output) => return output,     // a defer can resolve straight to a result
     }
     // 3. EXECUTE
     ctx.emit(ToolStarted(call.id));
@@ -57,22 +61,26 @@ async fn run_tool_call(call, ctx) -> ToolOutput {
 
 Every wait (review, ask_user answer) lives **inside** the call's own future, so `FuturesUnordered` advances siblings whenever one suspends. Cross-call blocking is not expressible — structural immunity to the v1 bug class.
 
-### Component 2 — ops dispatcher: the single `ops_rx` consumer + explicit routing table
+### Component 2 — per-turn ops dispatcher: the sole `ops_rx` consumer, routing all variants
+
+The dispatcher **subsumes both** of today's op readers — `drain_ops` (try_recv at iteration boundaries) **and** `resolve_deferred_slots` (recv during deferred waits) — because `mpsc::Receiver` has a single consumer; they cannot coexist with it. It routes **every** `AgentOp` variant to one of **two destination kinds**:
 
 ```rust
-async fn ops_dispatcher.run(ops_rx) {
-    while let Some(op) = ops_rx.recv().await {
-        match op {
-            AskUserAnswer { call_id, answer } => self.waiters.deliver(call_id, answer), // wake THAT call; buffer if none
-            Interrupt                          => self.cancel_token.cancel(),
-            // … every other AgentOp variant gets an explicit arm (enumerate them all in Batch 0)
-        }
-    }
+match op {
+    // ── turn-level (NOT per-call) ──
+    Interrupt          => self.cancel_token.cancel(),              // cancel the turn
+    InjectUserMessage(m) => self.turn_queue.push_message(m),       // applied at the next iteration boundary
+    InjectHint(h)      => self.turn_queue.push_hint(h),            // (same)
+    // ── per-call (the generic defer/resume) ──
+    AskUserAnswer{call_id, answer} => self.waiters.deliver(call_id, answer),  // ask_user extension waiter
+    ApprovePlan{..}                => self.waiters.deliver(..),               // planning waiter
+    ExtensionResume{call_id, ..}   => { interceptor.on_op(&op); self.waiters.deliver(call_id, ..) }, // keep on_op side effects
 }
 ```
 
-- `waiters: Mutex<HashMap<CallId, oneshot::Sender<Answer>>>` + a buffer for unmatched answers (replicates today's `ask_user` no-pending / wildcard semantics).
-- Splits today's `resolve_deferred_slots` (which couples "drain ops" + "resolve batch slots") into **dispatcher routes ops** + **each call awaits its own waiter** — clean separation of concerns.
+- **`waiters`**: a per-turn registry `Mutex<HashMap<CallId, oneshot::Sender>>` + an unmatched-answer **buffer** + **wildcard FIFO** + **pre-buffer** (these replicate today's `ask_user`/defer semantics — the existing tests are the spec).
+- **Two routing kinds matter:** `Interrupt`/`Inject*` are **turn-level** (cancel token / a pending message+hint queue applied at iteration boundaries) — they are NOT per-call waiters. `AskUserAnswer`/`ApprovePlan`/`ExtensionResume` are **per-call** defer resumes routed by `call_id`. (Today: `drain_ops`→`apply_op` handles Inject*/Interrupt; `resolve_deferred_slots`→`on_op` handles the defers. The dispatcher merges both.)
+- This splits today's `resolve_deferred_slots` (which couples "drain ops" + "resolve batch slots") into **dispatcher routes ops** + **each call awaits its own waiter**.
 
 ### Component 3 — two waits, two owners (the decoupling)
 
@@ -83,9 +91,13 @@ async fn ops_dispatcher.run(ops_rx) {
 
 They share no slot/resolve code. v1's root cause (shared machinery) is structurally gone.
 
-### Component 4 — streaming = same model
+> Note (Batch 0): `AgentOp::AskUserAnswer` has **two meanings** today — permission approval (the `DeferredPermission` slot) AND the `ask_user` extension. Batch B **removes the permission meaning** (it becomes `reviewer.review()`); the extension meaning stays, routed by the dispatcher to the `ask_user` waiter.
 
-Streamed tool calls are just more `run_tool_call` futures pushed into the **same** `FuturesUnordered`. No `ReviewPending` special case in `streaming_executor.rs`. Streaming's only concern stays output-chunk ordering, not approval.
+### Component 4 — result ordering + streaming
+
+**Ordering (Batch 0):** results must stay in **request/canonical order**, as today. Non-streaming uses order-preserving `join_all` + index-based reassembly (`combine_intercepted_slots`); streaming reassembles by id into `canonical_items` order. The new model keeps this: internally a `FuturesUnordered` for readiness is fine, but the externally visible results MUST be reassembled to request order before finalization (an unordered collection would be a behavior change).
+
+**Streaming = same model:** streamed tool calls are just more `run_tool_call` futures (submitted as each complete `ToolUse` chunk arrives, still eagerly via `tokio::spawn`/`FuturesUnordered` so execution overlaps the LLM stream). Remove only the **duplicated approval/defer logic** from `streaming_executor.rs` — keep its streaming-specific chunk dedupe/ordering. No `ReviewPending` special case.
 
 ### Component 5 — cancellation
 
@@ -107,19 +119,21 @@ Streamed tool calls are just more `run_tool_call` futures pushed into the **same
 
 > Batches run in order, each gated by its own review. Within a batch, each numbered step is a commit. **If a step shows the model is wrong, STOP and revise Part 1, re-review — do not patch around it.**
 
-### Batch 0 — Validate the model against `ee9fec4` (no production code)
+### Batch 0 — Validate the model against `ee9fec4` ✅ DONE (2026-05-30)
 
-- [ ] **0.1** Map today's real flow precisely: where the sequential pre-pass is, what `InterceptedSlot` variants exist, who owns `ops_rx` today and **every** `AgentOp` variant + how each is handled (so the dispatcher's routing table is complete — this is the gap that sank my first draft).
-- [ ] **0.2** Confirm `run_tool_call` can own the `ask_user` interceptor wait: where does interceptor dispatch happen today, and can it move inside the per-call future and await a dispatcher-delivered answer while preserving the ask_user suite's semantics (buffer / wildcard / no-pending / timeout / interrupt)?
-- [ ] **0.3** Confirm the streaming-eager path can run `run_tool_call` per streamed call instead of its `tokio::spawn` special case.
-- [ ] **Output:** a short validation note. If anything in Part 1 needs adjusting (e.g. an op type that can't be cleanly routed), revise Part 1 and re-review BEFORE Batch A. No code lands in Batch 0.
+Result: **[2026-05-30-task7-batch0-validation.md](2026-05-30-task7-batch0-validation.md)** (file:line evidence). Verdict: the per-call model holds, but Part 1 was under-specified. The 5 corrections are now folded into Part 1 above:
+1. **Dispatcher lifetime = per-turn** (ops_rx is per-run, not session) — scoped task aborted at turn terminal, NOT `join!`'d. (This corrected an earlier wrong "session-long" guess.)
+2. **Dispatcher routes all 6 `AgentOp` variants** with turn-level (Interrupt/Inject*) vs per-call (defer resumes) destinations; it subsumes both `drain_ops` and `resolve_deferred_slots`.
+3. **Generic defer protocol** (`ToolDecision::Defer` / `ResumeDeferred` / `ExtensionResume`) — not ask_user-only; planning uses it too.
+4. **Interceptor ctx needs a waiter handle; must not hold the interceptor-set mutex while awaiting.**
+5. **Order-preserving** results (join_all + reassembly), as today.
 
 ### Batch A — Structural rewrite, **ZERO behavior change** (the large, risky batch)
 
 > Goal of Batch A: replace the two-phase pipeline with the dispatcher + `run_tool_call` model, with permission still `Allow`/`Deny` only (reviewer NOT consulted) and `ask_user` on the new waiter mechanism — and the **entire existing test suite green, behavior identical**. This isolates "the big structural rewrite" from "the new feature" (Batch B). It is the anti-v1 discipline.
 
 - [ ] **A.1 — ops dispatcher + waiter registry.** Build `ops_dispatcher` as the single `ops_rx` consumer with the full routing table from Batch 0, and `waiters` (per-call oneshot map + unmatched-answer buffer). Not yet wired into execution. Unit-test: an `AskUserAnswer` for a registered call wakes it; for no/ wildcard call it buffers; `Interrupt` cancels. Commit.
-- [ ] **A.2 — `run_tool_call` + `FuturesUnordered` batch.** Introduce the per-call future (permission `Allow`/`Deny` only for now; interceptor dispatch incl. `ask_user` via the dispatcher waiter; execute). Replace the pre-pass + `join!(resolve_deferred_slots, execute_tools_parallel)` with `join!(dispatcher.run, FuturesUnordered<run_tool_call>)`. Remove `resolve_deferred_slots` and the `InterceptedSlot` defer variants. **Acceptance: the full existing suite is green and behavior is identical** — especially every `interceptors::ask_user` / `ask_user_e2e` / `defer_protocol` / `contract` / `permission_*` test passes UNCHANGED. (The `ask_user` tests are the spec for the waiter mechanism — keep them green.) Commit.
+- [ ] **A.2 — `run_tool_call` + order-preserving batch.** Introduce the per-call future (permission `Allow`/`Deny` only for now; interceptor dispatch handling the **generic `ToolDecision::Defer`** via the dispatcher waiter — covers ask_user AND planning; execute). Replace the sequential pre-pass + `join!(resolve_deferred_slots, execute_tools_parallel)` with: the **scoped per-turn dispatcher** (A.1) running alongside an order-preserving batch of `run_tool_call` futures, with results reassembled to request order and the **dispatcher aborted at turn terminal (NOT `join!`'d)**. Remove `resolve_deferred_slots` and the `InterceptedSlot` defer variants. **Acceptance: the full existing suite is green and behavior is identical** — especially every `interceptors::ask_user` / `interceptors::planning` / `ask_user_e2e` / `defer_protocol` / `contract` / `interactive_ops` / `permission_*` test passes UNCHANGED (these are the spec for the waiter mechanism). Commit.
 - [ ] **A.3 — streaming onto `run_tool_call`.** Move `streaming_executor.rs` to push `run_tool_call` futures into the shared set; remove its review/defer special-casing. Existing streaming tests pass unchanged. Commit.
 - [ ] **A.4 — symbolic invariant.** Replace the line-range allowlist with the `fn execute_tool`-span check. Commit.
 - [ ] **Batch A review gate:** STOP and report. Confirm zero behavior change (whole suite green, ask_user semantics intact), the dispatcher is the sole `ops_rx` owner, and no `InterceptedSlot` defer / `resolve_deferred_slots` remain. Only after this passes does Batch B start.
@@ -142,4 +156,4 @@ Streamed tool calls are just more `run_tool_call` futures pushed into the **same
 
 ## Highest risk
 
-The `ask_user` interceptor's resume mechanism changing from "batch resolver" to "per-call dispatcher waiter" (Batch A.2) — its test suite is the semantic spec; keep it green throughout. If A.2 cannot keep the ask_user suite green with the new waiter mechanism, STOP and revise Part 1 before continuing.
+Moving the **generic defer/resume** (`ToolDecision::Defer` → `ResumeDeferred`) from the batch resolver to the per-call dispatcher waiter (Batch A.2) — this covers the `ask_user` extension AND planning AND external extensions, not just ask_user. The existing defer/ask_user/planning test suites are the semantic spec (buffer / wildcard / no-pending / timeout / interrupt / pre-buffer); keep them ALL green throughout. If A.2 cannot preserve them on the new waiter mechanism, STOP and revise Part 1 before continuing.
