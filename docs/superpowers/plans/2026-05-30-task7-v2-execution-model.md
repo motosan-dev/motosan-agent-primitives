@@ -41,13 +41,14 @@ async fn run_tool_call(call, ctx) -> ToolOutput {
         }
     }
     // 2. INTERCEPTORS (pre). Any interceptor may return ToolDecision::Defer (the
-    //    GENERIC defer protocol — ask_user AND planning AND external extensions use
-    //    it, not just ask_user). On Defer, register a waiter[call.id] with the
-    //    dispatcher and await ResumeDeferred (racing timeout + cancel).
-    //    ⚠️ Do NOT hold the interceptor-set mutex across this await.
-    match ctx.interceptors.pre_tool_use(call, &ctx).await {  // ctx exposes a dispatcher/waiter handle
-        Continue(call)       => { /* execute */ }
-        Defer                => { let answer = ctx.waiters.register_and_wait(call.id).await?; /* resume */ }
+    //    GENERIC defer protocol — ask_user AND planning AND external extensions,
+    //    not just ask_user). On Defer, register a waiter[call.id] with the
+    //    dispatcher and await ResumeDeferred (racing timeout + cancel). Interceptors
+    //    are shared as Arc<InterceptorSet> (async &self); no coarse set-lock is held
+    //    across the await — the await is on the per-call waiter, not the set.
+    match ctx.interceptors.intercept_tool_call(call, &ctx).await? {  // ctx exposes the waiter handle
+        Proceed(call)        => { /* execute */ }
+        Defer { call_id }    => { let answer = ctx.waiters.register_and_wait(call_id).await?; /* resume */ }
         ShortCircuit(output) => return output,     // a defer can resolve straight to a result
     }
     // 3. EXECUTE
@@ -73,22 +74,28 @@ match op {
     InjectHint(h)        => self.turn_queue.push_hint(h),        // (same)
     // ── per-call defer/resume: route THROUGH the interceptor on_op chain (the MATCHER) ──
     AskUserAnswer{..} | ApprovePlan{..} | ExtensionResume{..} => {
-        // The interceptor SET owns the matching semantics (explicit call_id /
-        // wildcard FIFO / pre-buffer / no-pending). on_op is SHORT — it takes the
-        // interceptor-set lock briefly and NEVER awaits. The dispatcher only routes
-        // its decision to the right per-call channel.
-        match self.interceptors.on_op(&op) {        // dispatcher holds the interceptor-set handle
-            Resume { call_id, result } => self.waiters.deliver(call_id, result),
-            Buffered | NotMine         => {}         // matcher kept it / not a resume
+        // `InterceptorSet::on_op(&self, ..)` is ASYNC and returns
+        // Result<OpDecision, ExtError>, already applying each ext's ErrorPolicy
+        // (Fallback→continue, Abort→Err). It owns the matching (explicit-id /
+        // wildcard-FIFO / pre-buffer / no-pending). The dispatcher awaits it via
+        // an Arc handle — there is NO coarse set-lock to hold.
+        match self.interceptors.on_op(&op).await {              // Arc<InterceptorSet>, async
+            Ok(OpDecision::ResumeDeferred { call_id, result }) => self.waiters.deliver(call_id, result),
+            Ok(_ /* Pass/Handled/Reject/buffered */)           => {}
+            Err(e) => self.fail_turn(e),                        // Abort-policy error → terminal (see below)
         }
     }
 }
 ```
 
-- **Matching stays in the interceptors (do NOT re-implement it in the dispatcher).** Today `AskUserInterceptor::on_op` / `PlanningInterceptor::on_op` own explicit-id / wildcard-FIFO / pre-buffer / no-pending semantics. v2 keeps them there; the dispatcher just drives `on_op` and delivers its `Resume{call_id}` to that call's waiter. This is the lowest-risk path and what keeps the existing defer/ask_user/planning tests green.
+- **Type-fit corrections (surfaced by A.1):**
+  - `InterceptorSet` owns `Box<dyn LoopInterceptor>` with **async `&self`** methods; matching/pending state is **interior** to each interceptor. Share it post-`build()` as **`Arc<InterceptorSet>`**; the dispatcher's constructor takes it: **`OpsDispatcher::spawn(ops_rx, cancel_token, interceptors: Arc<InterceptorSet>) -> Self`**. (Requires the Engine to hold the set as `Arc` after build — a bounded change.)
+  - **No coarse set-lock.** Earlier "don't hold the interceptor-set mutex across await" was based on a wrong model — there is no such mutex. The dispatcher just `await`s `set.on_op` via the `Arc`.
+  - **New concurrency to verify (A.2):** in v2 the per-call `intercept_tool_call` (call side) and `on_op` (dispatcher side) run **concurrently against the same interceptor's interior state** — today they are in separate phases. Each interceptor's interior locks must be brief and safe under that concurrency. Verify/ensure for `ask_user` and `planning`; if not, that interior fix is part of A.2.
+  - **Error channel (Q3):** `on_op` `Err` only happens under `ErrorPolicy::Abort`. The dispatcher MUST treat it as a **terminal turn error** — `fail_turn(e)` records the error and cancels the token (mirroring today's `AbortedByHook` / `TurnResult`), so the engine surfaces it at turn terminal. Do NOT log-and-continue.
+- **Matching stays in the interceptors** (do NOT re-implement explicit-id/wildcard/buffer in the dispatcher) — keeps the existing defer/ask_user/planning tests green.
 - **`waiters`**: a per-turn registry `Mutex<HashMap<CallId, oneshot::Sender>>` — only the per-call wakeup channels, no matching logic.
-- **Lock discipline (correctness core, no deadlock):** the **call** side (`run_tool_call` step 2) takes the interceptor-set lock, gets `Defer`, **releases the lock, THEN awaits** its waiter. The **dispatcher** side calls `on_op` holding the lock only **briefly and without awaiting**. Neither holds the interceptor-set lock across an `await`.
-- **Two routing kinds:** `Interrupt`/`Inject*` are **turn-level** (cancel token / a pending message+hint queue applied at iteration boundaries), NOT per-call. `AskUserAnswer`/`ApprovePlan`/`ExtensionResume` are **per-call** resumes (matched by the interceptors, delivered by `call_id`). (Today `drain_ops`→`apply_op` does Inject*/Interrupt; `resolve_deferred_slots`→`on_op` does the defers — the dispatcher merges both.)
+- **Two routing kinds:** `Interrupt`/`Inject*` are **turn-level** (cancel token / a pending message+hint queue applied at iteration boundaries), NOT per-call. `AskUserAnswer`/`ApprovePlan`/`ExtensionResume` are **per-call** resumes. (Today `drain_ops`→`apply_op` does Inject*/Interrupt; `resolve_deferred_slots`→`on_op` does the defers — the dispatcher merges both.)
 
 ### Component 3 — two waits, two owners (the decoupling)
 
@@ -140,7 +147,7 @@ Result: **[2026-05-30-task7-batch0-validation.md](2026-05-30-task7-batch0-valida
 
 > Goal of Batch A: replace the two-phase pipeline with the dispatcher + `run_tool_call` model, with permission still `Allow`/`Deny` only (reviewer NOT consulted) and `ask_user` on the new waiter mechanism — and the **entire existing test suite green, behavior identical**. This isolates "the big structural rewrite" from "the new feature" (Batch B). It is the anti-v1 discipline.
 
-- [ ] **A.1 — ops dispatcher + waiter registry.** Build `ops_dispatcher` as the single `ops_rx` consumer with the full routing table from Batch 0, and `waiters` (per-call oneshot map + unmatched-answer buffer). Not yet wired into execution. Unit-test: an `AskUserAnswer` for a registered call wakes it; for no/ wildcard call it buffers; `Interrupt` cancels. Commit.
+- [ ] **A.1 — ops dispatcher + waiter registry (scaffolding, not wired).** Build `OpsDispatcher` per Component 2. Constructor `spawn(ops_rx, cancel_token, interceptors: Arc<InterceptorSet>) -> Self` (the set is shared as `Arc` post-build); `shutdown()`/abort; `register_and_wait(call_id, timeout)`; turn-queue drain. Defer-ops route `await self.interceptors.on_op(&op)` and deliver `ResumeDeferred{call_id}` to the waiter; matching stays in the interceptors. **Error path:** an `on_op` `Err` (Abort policy) → `fail_turn` (terminal error + cancel), NOT log-and-continue. Unit-test against a **mock `InterceptorSet`/interceptor**: registered call woken on `Resume`; buffered/`Pass` does not wake; `Interrupt` cancels; `Inject*` queue; `register_and_wait` honors timeout + cancel; **`on_op` `Err` under Abort policy signals the terminal-error channel**; `shutdown` stops without hang. NOT wired into the engine. Commit.
 - [ ] **A.2 — `run_tool_call` + order-preserving batch.** Introduce the per-call future (permission `Allow`/`Deny` only for now; interceptor dispatch handling the **generic `ToolDecision::Defer`** via the dispatcher waiter — covers ask_user AND planning; execute). Replace the sequential pre-pass + `join!(resolve_deferred_slots, execute_tools_parallel)` with: the **scoped per-turn dispatcher** (A.1) running alongside an order-preserving batch of `run_tool_call` futures, with results reassembled to request order and the **dispatcher aborted at turn terminal (NOT `join!`'d)**. Remove `resolve_deferred_slots` and the `InterceptedSlot` defer variants. **Acceptance: the full existing suite is green and behavior is identical** — especially every `interceptors::ask_user` / `interceptors::planning` / `ask_user_e2e` / `defer_protocol` / `contract` / `interactive_ops` / `permission_*` test passes UNCHANGED (these are the spec for the waiter mechanism). Commit.
 - [ ] **A.3 — streaming onto `run_tool_call`.** Move `streaming_executor.rs` to push `run_tool_call` futures into the shared set; remove its review/defer special-casing. Existing streaming tests pass unchanged. Commit.
 - [ ] **A.4 — symbolic invariant.** Replace the line-range allowlist with the `fn execute_tool`-span check. Commit.
